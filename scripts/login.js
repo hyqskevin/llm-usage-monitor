@@ -8,7 +8,7 @@ const PROFILE_DIR = path.join(__dirname, '..', 'browser-profile');
 
 const SITES = [
   { key: 'bigmodel', name: '智谱 BigModel', url: 'https://bigmodel.cn/coding-plan/personal/usage' },
-  { key: 'kimi',     name: 'Kimi Code',     url: 'https://www.kimi.com/code/console?from=kfc_overview_topbar' },
+  { key: 'kimi',     name: 'Kimi Code',     url: 'https://www.kimi.com/membership/subscription?tab=quota&from=kfc_console_upgrade' },
   { key: 'minimax',  name: 'MiniMax',       url: 'https://platform.minimaxi.com/console/usage' },
 ];
 

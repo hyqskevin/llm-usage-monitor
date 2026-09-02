@@ -23,8 +23,8 @@ const SITES = [
   {
     key: 'kimi',
     name: 'Kimi Code',
-    url: 'https://www.kimi.com/code/console?from=kfc_overview_topbar',
-    apiHints: [/usage/i, /quota/i, /console/i, /code/i],
+    url: 'https://www.kimi.com/membership/subscription?tab=quota&from=kfc_console_upgrade',
+    apiHints: [/usage/i, /quota/i, /membership/i, /subscription/i],
   },
   {
     key: 'minimax',

@@ -4,3 +4,6 @@ data/latest.json
 data/usage.db
 node_modules/
 .DS_Store
+data/cookies.json
+data/api-requests.json
+data/dashboard.html
