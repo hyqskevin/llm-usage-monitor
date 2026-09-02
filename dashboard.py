@@ -13,9 +13,10 @@ DB = os.path.join(ROOT, 'data', 'usage.db')
 OUT = os.path.join(ROOT, 'data', 'dashboard.html')
 
 SITES = {
-    'bigmodel': {'name': '智谱 GLM', 'color': '#8fa8c8'},
-    'kimi':     {'name': 'Kimi',     'color': '#c8a2a2'},
-    'minimax':  {'name': 'MiniMax',  'color': '#a3b8a3'},
+    'bigmodel':  {'name': '智谱 GLM',        'color': '#8fa8c8'},
+    'kimi':      {'name': 'Kimi（订阅总额）', 'color': '#c8a2a2'},
+    'kimi-code': {'name': 'Kimi Code',       'color': '#b5a6c9'},
+    'minimax':   {'name': 'MiniMax',         'color': '#a3b8a3'},
 }
 WINDOWS = {'5h': '5小时额度', 'week': '周额度', 'billing': '账期/订阅'}
 
@@ -69,12 +70,16 @@ def build_html(data):
   .dot {{ width: 10px; height: 10px; border-radius: 50%; display: inline-block; }}
   .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
             gap: 14px; margin-bottom: 14px; }}
-  .card {{ border: 1px solid var(--line); border-radius: 10px; padding: 14px; }}
-  .card .w {{ font-size: 13px; color: var(--muted); margin-bottom: 6px; }}
-  .card .v {{ font-size: 26px; font-weight: 600; }}
-  .card .d {{ font-size: 12px; color: var(--muted); margin-top: 4px; }}
-  .bar {{ height: 8px; background: #ece8e1; border-radius: 4px; margin-top: 10px; overflow: hidden; }}
-  .bar i {{ display: block; height: 100%; border-radius: 4px; }}
+  .card {{ border: 1px solid var(--line); border-radius: 10px; padding: 16px; }}
+  .card .w {{ font-size: 13px; color: var(--muted); margin-bottom: 10px;
+              display: flex; justify-content: space-between; }}
+  .card .w .pct {{ color: var(--text); font-weight: 600; }}
+  .bar {{ position: relative; height: 26px; background: #ece8e1; border-radius: 13px;
+          overflow: hidden; }}
+  .bar i {{ display: block; height: 100%; border-radius: 13px; transition: width .4s; }}
+  .bar span {{ position: absolute; inset: 0; display: flex; align-items: center;
+               justify-content: center; font-size: 12px; font-weight: 600; color: #4a4a48; }}
+  .card .d {{ font-size: 12px; color: var(--muted); margin-top: 8px; }}
   canvas {{ max-height: 240px; }}
   .charts {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }}
   .chart-box {{ border: 1px solid var(--line); border-radius: 10px; padding: 12px; }}
@@ -109,13 +114,12 @@ for (const [site, meta] of Object.entries(SITES)) {{
     const pct = last.pct;
     const pctText = pct == null ? '—' : pct.toFixed(1) + '%';
     let detail = '';
-    if (last.total) detail = `${{last.used?.toFixed(0)}} / ${{last.total.toFixed(0)}} · 剩 ${{last.remaining?.toFixed(0)}}`;
+    if (last.total) detail = `已用 ${{last.used?.toFixed(0)}} / ${{last.total.toFixed(0)}} 积分 · 剩 ${{last.remaining?.toFixed(0)}}`;
     else if (w === 'billing' && last.used) detail = '近30天 ' + (last.used/1e6).toFixed(0) + 'M tokens';
     const barW = pct == null ? 0 : Math.min(100, pct);
-    cards += `<div class="card"><div class="w">${{wname}}</div>
-      <div class="v">${{pctText}}</div>
-      <div class="d">${{detail}} ${{fmtReset(last.reset_at)}}</div>
-      <div class="bar"><i style="width:${{barW}}%;background:${{meta.color}}"></i></div></div>`;
+    cards += `<div class="card"><div class="w"><span>${{wname}}</span><span class="pct">${{pctText}}</span></div>
+      <div class="bar"><i style="width:${{barW}}%;background:${{meta.color}}"></i><span>${{pct == null ? '' : '已用 ' + pctText}}</span></div>
+      <div class="d">${{detail}} ${{fmtReset(last.reset_at)}}</div></div>`;
     charts += `<div class="chart-box"><div class="t">${{wname}}使用趋势</div>
       <canvas id="c-${{site}}-${{w}}"></canvas></div>`;
   }}

@@ -88,6 +88,7 @@ def fetch_bigmodel(reqs):
 
 
 def fetch_kimi(reqs):
+    """返回 (kimi_rows, kimi_code_rows)：kimi=整体订阅额度，kimi-code=编程额度"""
     r = reqs['kimi'][0]
     h = pick_headers(r, ('authorization', 'x-msh-session-id', 'x-msh-device-id',
                          'x-msh-platform', 'x-msh-version', 'connect-protocol-version',
@@ -95,19 +96,24 @@ def fetch_kimi(reqs):
     resp = http('POST', r['url'], h, {})
     if 'ratelimitCode5h' not in resp:
         raise RuntimeError(f'kimi auth failed: {str(resp)[:120]}')
-    out = []
+    kimi, code = [], []
     rl5, rl7 = resp['ratelimitCode5h'], resp['ratelimitCode7d']
-    out.append({'window': '5h', 'used_pct': rl5['ratio'] * 100,
-                'used': None, 'total': None, 'remaining': None,
-                'reset_at': rl5.get('resetTime')})
-    out.append({'window': 'week', 'used_pct': rl7['ratio'] * 100,
-                'used': None, 'total': None, 'remaining': None,
-                'reset_at': rl7.get('resetTime')})
+    code.append({'window': '5h', 'used_pct': rl5['ratio'] * 100,
+                 'used': None, 'total': None, 'remaining': None,
+                 'reset_at': rl5.get('resetTime')})
+    code.append({'window': 'week', 'used_pct': rl7['ratio'] * 100,
+                 'used': None, 'total': None, 'remaining': None,
+                 'reset_at': rl7.get('resetTime')})
     bal = resp.get('subscriptionBalance') or {}
     if 'amountUsedRatio' in bal:
-        out.append({'window': 'billing', 'used_pct': bal['amountUsedRatio'] * 100,
-                    'used': None, 'total': None, 'remaining': None, 'reset_at': None})
-    return out
+        kimi.append({'window': 'billing', 'used_pct': bal['amountUsedRatio'] * 100,
+                     'used': None, 'total': None, 'remaining': None,
+                     'reset_at': bal.get('expireTime')})
+    if 'kimiCodeUsedRatio' in bal:
+        code.append({'window': 'billing', 'used_pct': bal['kimiCodeUsedRatio'] * 100,
+                     'used': None, 'total': None, 'remaining': None,
+                     'reset_at': bal.get('expireTime')})
+    return kimi, code
 
 
 def fetch_minimax(cookies):
@@ -169,13 +175,17 @@ def main():
     rows, errors = [], {}
     refreshed = False
 
-    for site, fn in (('bigmodel', lambda: fetch_bigmodel(reqs)),
-                     ('kimi', lambda: fetch_kimi(reqs)),
-                     ('minimax', lambda: fetch_minimax(cookies))):
+    def collect_kimi():
+        kimi_rows, code_rows = fetch_kimi(reqs)
+        return [{'site': 'kimi', **i} for i in kimi_rows] + \
+               [{'site': 'kimi-code', **i} for i in code_rows]
+
+    for site, fn in (('bigmodel', lambda: [{'site': 'bigmodel', **i} for i in fetch_bigmodel(reqs)]),
+                     ('kimi', collect_kimi),
+                     ('minimax', lambda: [{'site': 'minimax', **i} for i in fetch_minimax(cookies)])):
         for attempt in range(2):
             try:
-                for item in fn():
-                    rows.append({'site': site, **item})
+                rows.extend(fn())
                 break
             except Exception as e:
                 if attempt == 0 and not refreshed:
