@@ -1,0 +1,6 @@
+browser-profile/
+data/raw/
+data/latest.json
+data/usage.db
+node_modules/
+.DS_Store
