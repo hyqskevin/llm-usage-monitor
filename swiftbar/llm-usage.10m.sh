@@ -31,6 +31,22 @@ WNAMES = {'5h': '5小时', 'week': '周', 'billing': '账期'}
 TITLE_WINDOW = {'bigmodel': '5h', 'kimi': 'billing', 'kimi-code': '5h', 'minimax': '5h'}
 ROOT = sys.argv[2]
 
+# 菜单栏头部 emoji 进度条字符
+SITE_EMOJI = {
+    'bigmodel':  ('🟦', '⬜'),   # 蓝灰
+    'kimi':      ('🟥', '⬜'),   # 粉
+    'kimi-code': ('🟪', '⬜'),   # 紫
+    'minimax':   ('🟩', '⬜'),   # 绿
+}
+def format_emoji_bar(pct):
+    if pct is None:
+        return '⬜⬜⬜'
+    filled = round(max(0, min(100, pct)) / 100 * 4)
+    return '▰' * filled + '▱' * (4 - filled)
+def color_swatch(site):
+    full, empty = SITE_EMOJI.get(site, ('⬛', '⬜'))
+    return full
+
 # ============= 零依赖 PNG 编码器（RGBA） =============
 def png_bytes(width, height, pixels):
     """pixels: bytes of length W*H*4, RGBA, top-down."""
@@ -158,10 +174,12 @@ for site in ('bigmodel', 'kimi', 'kimi-code', 'minimax'):
     else:
         parts.append(NAMES[site] + '?')
 title_suffix = ' ⚠️' if errors else ''
-# header 第一行：title 是个空格占位，| image=<base64> 是真实图片
-print(' ' + ' | image=' + b64(icon_png) + ' size=14')
-# header 第二行（轮播）：文字百分比
-print(' '.join(parts) + title_suffix + ' | size=13 dropdown=false')
+# header 第一行：紧凑 emoji 进度条 + 百分比数值（最稳的菜单栏展示方式）
+header_text = ''.join(
+    (color_swatch(items[i][1]) + format_emoji_bar(items[i][0]))
+    for i in range(len(items))
+) + ' ' + ' '.join(parts) + title_suffix
+print(header_text + ' | size=12')
 
 # ============= 下拉菜单 =============
 print('---')
