@@ -51,42 +51,40 @@ def b64(data):
 def lerp(a, b, t):
     return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
 
-def health_color(pct):
-    """<70 绿、<85 琥珀、<95 橙红、>=95 红"""
-    if pct is None: return (0x70, 0x70, 0x70)
-    if pct >= 95:   return (0xc4, 0x66, 0x5c)
-    if pct >= 85:   return (0xd9, 0x93, 0x6e)
-    if pct >= 70:   return (0xd4, 0xa8, 0x6a)
-    return (0x7f, 0xae, 0x8a)
+def health_color(pct, site=None):
+    """<70 绿、<85 琥珀、<95 橙红、>=95 红（不传 site 时）；传了 site 则按站点主色为基色。"""
+    site_colors = {
+        'bigmodel':  (0x7d, 0x96, 0xb5),  # 蓝灰
+        'kimi':      (0xc8, 0x9a, 0x9a),  # 粉
+        'kimi-code': (0xa5, 0x94, 0xb8),  # 紫
+        'minimax':   (0x8f, 0xb0, 0x8f),  # 绿
+    }
+    base = site_colors.get(site, (0x70, 0x70, 0x70))
+    if pct is None:
+        return lerp(base, (255, 255, 255), 0.5)
+    if pct >= 95:   danger = (0xc4, 0x66, 0x5c)  # 红
+    elif pct >= 85: danger = (0xd9, 0x93, 0x6e)  # 橙红
+    elif pct >= 70: danger = (0xd4, 0xa8, 0x6a)  # 琥珀
+    else:           danger = base                  # 健康：站点本色
+    return danger
 
 # ============= 画进度条 PNG =============
-def bar_image(pct, width, height=14, bg=(0xec, 0xe8, 0xe1),
-              radius=4, shadow=False):
-    """绘制单个进度条 PNG。已用段用 health_color 渐变；剩余段 bg。"""
-    pixels = bytearray(width * height * 4)
-    # 简易圆角：用边角透明实现，bg 全图
+def draw_bar(pct, width, height=16, site=None, radius=0):
+    """单个进度条 PNG（直角，无锯齿），按站点着色 + 用量健康度微调。"""
+    bg = (0xec, 0xe8, 0xe1)
     if pct is None:
         pct_disp = 0
     else:
         pct_disp = max(0, min(100, pct))
     fill_w = round(width * pct_disp / 100)
-
-    # 把图像分 3 个区段：左侧已用渐变、右侧剩余、两侧圆角
-    fill_color = health_color(pct)
-    fill_hi    = lerp(fill_color, (255, 255, 255), 0.25)
-    fill_lo    = lerp(fill_color, (0, 0, 0), 0.18)
-
+    fill_color = health_color(pct, site=site)
+    fill_hi = lerp(fill_color, (255, 255, 255), 0.20)
+    fill_lo = lerp(fill_color, (0, 0, 0), 0.15)
+    pixels = bytearray(width * height * 4)
     for y in range(height):
         for x in range(width):
             i = (y * width + x) * 4
-            # 圆角裁剪：左上/右上/左下/右下角的像素透明
-            cx, cy = min(x, width-1-x), min(y, height-1-y)
-            if cx < radius and cy < radius:
-                dist = (radius - cx) ** 2 + (radius - cy) ** 2
-                if dist > radius * radius:
-                    pixels[i:i+4] = b'\x00\x00\x00\x00'
-                    continue
-            # 已用段：纵向渐变（顶部稍亮，底部稍暗）
+            # 直角（radius=0），全部实心像素
             if x < fill_w:
                 t = y / max(1, height - 1)
                 c = lerp(fill_hi, fill_lo, t)
@@ -95,50 +93,25 @@ def bar_image(pct, width, height=14, bg=(0xec, 0xe8, 0xe1),
                 pixels[i:i+4] = bytes((bg[0], bg[1], bg[2], 255))
     return png_bytes(width, height, bytes(pixels))
 
-def multi_strip_image(items, total_w, h=14, gap=4, bg=(0xec, 0xe8, 0xe1)):
-    """items: list of (site_key, used_pct). 生成一行水平拼接进度条 PNG。"""
+def draw_strip(items, total_w, h=14, gap=4):
+    """items: list of (pct, site). 多站点拼接成一行。"""
     n = len(items)
     bar_w = (total_w - gap * (n - 1)) // n
+    bg = (0xec, 0xe8, 0xe1)
     pixels = bytearray(total_w * h * 4)
-    for idx, (site, pct) in enumerate(items):
-        x0 = idx * (bar_w + gap)
-        bar = bar_image(pct, bar_w, h, bg=bg)
-        # 把这段 bar 像素复制到整体
-        bar_px = bar  # 实际是 PNG；我们直接重新渲染而不是解 PNG
-        # 直接逐像素写入：
-        for y in range(h):
-            for x in range(bar_w):
-                i = (y * total_w + x0 + x) * 4
-                # 调用 bar_image 的内层逻辑不优雅，改用共享 draw_bar_into：
-                pass
-    # 上面那段嵌套太乱，直接重写 draw 函数：
-    return _draw_strip(items, total_w, h, gap, bg)
-
-def _draw_strip(items, total_w, h=14, gap=4, bg=(0xec, 0xe8, 0xe1)):
-    n = len(items)
-    bar_w = (total_w - gap * (n - 1)) // n
-    pixels = bytearray(total_w * h * 4)
-    radius = 4
-    for idx, (pct, _site) in enumerate(items):
+    for idx, (pct, site) in enumerate(items):
         x0 = idx * (bar_w + gap)
         if pct is None:
             pct_disp = 0
         else:
             pct_disp = max(0, min(100, pct))
         fill_w = round(bar_w * pct_disp / 100)
-        fill_color = health_color(pct)
-        fill_hi = lerp(fill_color, (255, 255, 255), 0.25)
-        fill_lo = lerp(fill_color, (0, 0, 0), 0.18)
+        fill_color = health_color(pct, site=site)
+        fill_hi = lerp(fill_color, (255, 255, 255), 0.20)
+        fill_lo = lerp(fill_color, (0, 0, 0), 0.15)
         for y in range(h):
             for x in range(bar_w):
                 i = (y * total_w + x0 + x) * 4
-                # 圆角裁剪
-                cx_local, cy_local = min(x, bar_w-1-x), min(y, h-1-y)
-                if cx_local < radius and cy_local < radius:
-                    dist = (radius - cx_local) ** 2 + (radius - cy_local) ** 2
-                    if dist > radius * radius:
-                        pixels[i:i+4] = b'\x00\x00\x00\x00'
-                        continue
                 if x < fill_w:
                     t = y / max(1, h - 1)
                     c = lerp(fill_hi, fill_lo, t)
@@ -146,35 +119,6 @@ def _draw_strip(items, total_w, h=14, gap=4, bg=(0xec, 0xe8, 0xe1)):
                 else:
                     pixels[i:i+4] = bytes((bg[0], bg[1], bg[2], 255))
     return png_bytes(total_w, h, bytes(pixels))
-
-def draw_bar(pct, width, height=14, radius=4):
-    """重写：单个进度条 PNG。"""
-    bg = (0xec, 0xe8, 0xe1)
-    if pct is None:
-        pct_disp = 0
-    else:
-        pct_disp = max(0, min(100, pct))
-    fill_w = round(width * pct_disp / 100)
-    fill_color = health_color(pct)
-    fill_hi = lerp(fill_color, (255, 255, 255), 0.25)
-    fill_lo = lerp(fill_color, (0, 0, 0), 0.18)
-    pixels = bytearray(width * height * 4)
-    for y in range(height):
-        for x in range(width):
-            i = (y * width + x) * 4
-            cx_local, cy_local = min(x, width-1-x), min(y, height-1-y)
-            if cx_local < radius and cy_local < radius:
-                dist = (radius - cx_local) ** 2 + (radius - cy_local) ** 2
-                if dist > radius * radius:
-                    pixels[i:i+4] = b'\x00\x00\x00\x00'
-                    continue
-            if x < fill_w:
-                t = y / max(1, height - 1)
-                c = lerp(fill_hi, fill_lo, t)
-                pixels[i:i+4] = bytes((c[0], c[1], c[2], 255))
-            else:
-                pixels[i:i+4] = bytes((bg[0], bg[1], bg[2], 255))
-    return png_bytes(width, height, bytes(pixels))
 
 # ============= 数据加载 =============
 try:
@@ -199,11 +143,11 @@ def remain(site, window):
     return (100 - p) if p is not None else None
 
 # ============= 菜单栏图标（header） =============
-# 4 站点一行小条 + 文字百分比
-items = [(site, pct_of(site, TITLE_WINDOW[site])) for site in ('bigmodel', 'kimi', 'kimi-code', 'minimax')]
+# 4 站点一行小条，按站点主色 + 健康度调色
+items = [(pct_of(site, TITLE_WINDOW[site]), site) for site in ('bigmodel', 'kimi', 'kimi-code', 'minimax')]
 ICON_W = 200
 ICON_H = 12
-icon_png = _draw_strip([(p, s) for s, p in items], ICON_W, h=ICON_H, gap=4)
+icon_png = draw_strip(items, ICON_W, h=ICON_H, gap=4)
 
 # 菜单栏标题：「图 + 文字百分比」
 parts = []
@@ -214,7 +158,7 @@ for site in ('bigmodel', 'kimi', 'kimi-code', 'minimax'):
     else:
         parts.append(NAMES[site] + '?')
 title_suffix = ' ⚠️' if errors else ''
-# header 第一行：base64 当 title + size 控制菜单栏显示高度
+# header 第一行：base64 当 title（彩色图，非模板）
 print(b64(icon_png) + ' | size=14')
 # header 第二行（轮播）：文字百分比
 print(' '.join(parts) + title_suffix + ' | size=13 dropdown=false')
@@ -236,13 +180,13 @@ for site in ('bigmodel', 'kimi', 'kimi-code', 'minimax'):
         pct = r['used_pct']
         label = WNAMES.get(r['window'], r['window'])
         if pct is not None:
-            # 240x16 大进度条图（菜单中放大显示更清晰）
-            bar_png = draw_bar(pct, 240, height=16, radius=5)
+            # 240x16 大进度条图（菜单中放大显示更清晰），按站点着色
+            bar_png = draw_bar(pct, 240, height=16, site=site, radius=0)
             detail = ''
             if r.get('total'):
                 detail = '  ' + format(r['used'], '.0f') + '/' + format(r['total'], '.0f')
-            # 图片行：base64 当 title + templateImage=false
-            print(b64(bar_png) + ' | templateImage=false')
+            # 图片行：base64 当 title（彩色图）
+            print(b64(bar_png) + ' | size=16')
             print('   ' + format(pct, '5.1f') + '%  ' + label + detail + ' | size=12 color=#d6d3cc')
         elif r.get('used') and r['window'] == 'billing':
             buf = label + ': 近30天 ' + format(r['used']/1e6, '.0f') + 'M tokens'
