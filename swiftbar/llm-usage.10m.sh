@@ -184,23 +184,117 @@ if ts:
     local = datetime.fromisoformat(ts).astimezone().strftime('%H:%M:%S')
     print('更新于 ' + local + ' | color=gray')
 
-# 每站点独立板块，每行一条带图片进度条
-for site in ('bigmodel', 'kimi', 'kimi-code', 'minimax'):
-    site_rows = [r for r in rows if r['site'] == site]
-    if not site_rows:
-        continue
-    print(FULL[site] + ' | size=13 color=gray')
-    for r in site_rows:
+# Kimi 合并视图：把 kimi/billing + kimi-code/billing 合并画到「Kimi」组顶部
+def pct_of_rows(rs, window):
+    for r in rs:
+        if r['window'] == window and r['used_pct'] is not None:
+            return r
+    return None
+
+kimi_rows = [r for r in rows if r['site'] == 'kimi']
+kimi_code_rows = [r for r in rows if r['site'] == 'kimi-code']
+bigmodel_rows = [r for r in rows if r['site'] == 'bigmodel']
+minimax_rows = [r for r in rows if r['site'] == 'minimax']
+
+def draw_segmented_bar(kimi_pct, code_pct, width=240, height=16):
+    """Kimi 总额进度条（按页面截图样式）：
+       已用部分按比例分成 Kimi(粉) + Code(蓝)，剩余 bg。
+       amountUsedRatio=已用总量；kimiCodeUsedRatio=Code 在已用里占的比例（不是占总比例）。
+    """
+    bg = (0xec, 0xe8, 0xe1)
+    pixels = bytearray(width * height * 4)
+    kimi_pct = kimi_pct or 0
+    code_pct = code_pct or 0
+    total_used_w = round(width * min(100, kimi_pct) / 100)
+    # Code 在已用部分中的占比 = code_pct / kimi_pct
+    code_share = (code_pct / kimi_pct) if kimi_pct > 0 else 0
+    code_w = round(total_used_w * code_share)
+    code_w = min(code_w, total_used_w)
+    kimi_seg = total_used_w - code_w
+    code_color = (0x70, 0xa8, 0xe8)  # Code 蓝
+    kimi_color = (0xc8, 0x9a, 0x9a)  # Kimi 粉
+    code_hi = lerp(code_color, (255, 255, 255), 0.18)
+    code_lo = lerp(code_color, (0, 0, 0), 0.15)
+    kimi_hi = lerp(kimi_color, (255, 255, 255), 0.18)
+    kimi_lo = lerp(kimi_color, (0, 0, 0), 0.15)
+    for y in range(height):
+        for x in range(width):
+            i = (y * width + x) * 4
+            if x < kimi_seg:
+                t = y / max(1, height - 1)
+                c = lerp(kimi_hi, kimi_lo, t)
+                pixels[i:i+4] = bytes((c[0], c[1], c[2], 255))
+            elif x < kimi_seg + code_w:
+                t = y / max(1, height - 1)
+                c = lerp(code_hi, code_lo, t)
+                pixels[i:i+4] = bytes((c[0], c[1], c[2], 255))
+            else:
+                pixels[i:i+4] = bytes((bg[0], bg[1], bg[2], 255))
+    return png_bytes(width, height, bytes(pixels))
+
+def fmt_reset_inline(iso):
+    if not iso: return '—'
+    try:
+        d = datetime.fromisoformat(iso)
+        return d.strftime('%Y-%m-%d') + ' 后重置'
+    except Exception:
+        return '—'
+
+# 1) 智谱板块
+if bigmodel_rows:
+    print(FULL['bigmodel'] + ' | size=13 color=gray')
+    for r in bigmodel_rows:
+        pct = r['used_pct']
+        label = WNAMES.get(r['window'], r['window'])
+        if pct is not None:
+            bar_png = draw_bar(pct, 240, height=16, site='bigmodel', radius=0)
+            detail = ''
+            if r.get('total'):
+                detail = '  ' + format(r['used'], '.0f') + '/' + format(r['total'], '.0f')
+            print(' ' + ' | image=' + b64(bar_png))
+            print('   ' + format(pct, '5.1f') + '%  ' + label + detail + ' | size=12 color=#d6d3cc')
+
+# 2) Kimi 合并板块：顶部 = 总用量（Kimi + Code 分段进度条），底部 = 各窗口细分
+if kimi_rows or kimi_code_rows:
+    print('---')
+    print('Kimi（订阅总额） | size=14 color=#a87373')
+    kimi_billing = pct_of_rows(kimi_rows, 'billing')
+    code_billing = pct_of_rows(kimi_code_rows, 'billing')
+    if kimi_billing and code_billing:
+        total_pct = kimi_billing['used_pct']
+        code_pct = code_billing['used_pct']
+        seg_png = draw_segmented_bar(total_pct, code_pct, width=240, height=18)
+        print(' ' + ' | image=' + b64(seg_png))
+        print('   总使用量  ' + format(total_pct, '.1f') + '%     ' + fmt_reset_inline(kimi_billing.get('reset_at')) + ' | size=13')
+        # 图例
+        print('   🟥 Kimi   🟦 Code' + ' | size=11 color=#8a8680')
+        # 细分行
+        kimi_only = max(0, total_pct - code_pct)
+        print('   Kimi  ' + format(kimi_only, '.1f') + '%   |   Code  ' + format(code_pct, '.1f') + '%' + ' | size=11 color=#a8a4a0')
+
+# 3) Kimi Code 限流细分（5h/周）
+if kimi_code_rows:
+    for window_key, window_name in (('5h', 'Code 5小时'), ('week', 'Code 周限额')):
+        r = pct_of_rows(kimi_code_rows, window_key)
+        if r is None: continue
+        seg_png = draw_segmented_bar(r['used_pct'], r['used_pct'], width=240, height=16)
+        print(' ' + ' | image=' + b64(seg_png))
+        print('   ' + window_name + ': ' + format(r['used_pct'], '.1f') + '%' + ' | size=12 color=#d6d3cc')
+
+# 4) MiniMax
+if minimax_rows:
+    print('---')
+    print(FULL['minimax'] + ' | size=13 color=gray')
+    for r in minimax_rows:
         pct = r['used_pct']
         label = WNAMES.get(r['window'], r['window'])
         if pct is not None:
             if r.get('unlimited'):
-                # MiniMax 周限额无限制：显示 ∞ + 仍画 100% 满色条
-                bar_png = draw_bar(pct, 240, height=16, site=site, radius=0)
+                bar_png = draw_bar(pct, 240, height=16, site='minimax', radius=0)
                 print(' ' + ' | image=' + b64(bar_png))
                 print('   ' + format(pct, '5.1f') + '%  ' + label + '  ∞ 无限制' + ' | size=12 color=#d6d3cc')
             else:
-                bar_png = draw_bar(pct, 240, height=16, site=site, radius=0)
+                bar_png = draw_bar(pct, 240, height=16, site='minimax', radius=0)
                 detail = ''
                 if r.get('total'):
                     detail = '  ' + format(r['used'], '.0f') + '/' + format(r['total'], '.0f')
