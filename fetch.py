@@ -134,11 +134,14 @@ def fetch_minimax(cookies):
                         if m.get('end_time') else None,
         })
         wpct = m.get('current_weekly_used_percent', '').rstrip('%')
+        # MiniMax 高级订阅周限额 = -1 表示无限制
+        weekly_unlimited = m.get('current_weekly_total_count') == -1
         if wpct:
             out.append({
                 'window': 'week',
                 'used_pct': float(wpct),
                 'used': None, 'total': None, 'remaining': None,
+                'unlimited': weekly_unlimited,
                 'reset_at': datetime.fromtimestamp(m['weekly_end_time'] / 1000, tz=timezone.utc).isoformat()
                             if m.get('weekly_end_time') else None,
             })
@@ -163,8 +166,13 @@ def init_db(conn):
         ts TEXT NOT NULL,
         site TEXT NOT NULL,
         window TEXT NOT NULL,
-        used_pct REAL, used REAL, total REAL, remaining REAL, reset_at TEXT
+        used_pct REAL, used REAL, total REAL, remaining REAL, reset_at TEXT,
+        unlimited INTEGER DEFAULT 0
     )''')
+    # 兼容旧表：如果 unlimited 列不存在则加上
+    cols = {r[1] for r in conn.execute('PRAGMA table_info(snapshots)').fetchall()}
+    if 'unlimited' not in cols:
+        conn.execute('ALTER TABLE snapshots ADD COLUMN unlimited INTEGER DEFAULT 0')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_ts ON snapshots(ts)')
 
 
@@ -204,10 +212,10 @@ def main():
     init_db(conn)
     for r in rows:
         conn.execute(
-            'INSERT INTO snapshots(ts, site, window, used_pct, used, total, remaining, reset_at)'
-            ' VALUES (?,?,?,?,?,?,?,?)',
+            'INSERT INTO snapshots(ts, site, window, used_pct, used, total, remaining, reset_at, unlimited)'
+            ' VALUES (?,?,?,?,?,?,?,?,?)',
             (ts, r['site'], r['window'], r['used_pct'], r['used'], r['total'],
-             r['remaining'], r['reset_at']))
+             r['remaining'], r['reset_at'], int(r.get('unlimited', False))))
     conn.commit()
 
     latest = {'ts': ts, 'rows': rows, 'errors': errors}
@@ -222,7 +230,9 @@ def main():
     for r in rows:
         pct = f"{r['used_pct']:.1f}%" if r['used_pct'] is not None else 'n/a'
         extra = ''
-        if r['total']:
+        if r.get('unlimited'):
+            extra = ' (∞ 无限制)'
+        elif r['total']:
             extra = f" ({r['used']:.0f}/{r['total']:.0f}, 剩 {r['remaining']:.0f})"
         elif r['used'] and r['window'] == 'billing':
             extra = f" (近30天 {r['used']/1e6:.0f}M tokens)"

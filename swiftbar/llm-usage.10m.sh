@@ -174,12 +174,8 @@ for site in ('bigmodel', 'kimi', 'kimi-code', 'minimax'):
     else:
         parts.append(NAMES[site] + '?')
 title_suffix = ' ⚠️' if errors else ''
-# header 第一行：紧凑 emoji 进度条 + 百分比数值（最稳的菜单栏展示方式）
-header_text = ''.join(
-    (color_swatch(items[i][1]) + format_emoji_bar(items[i][0]))
-    for i in range(len(items))
-) + ' ' + ' '.join(parts) + title_suffix
-print(header_text + ' | size=12')
+# header 第一行：纯数值（GLM 100% Kimi 78% KimiCode 45% MM 68%）
+print(' '.join(parts) + title_suffix + ' | size=12')
 
 # ============= 下拉菜单 =============
 print('---')
@@ -198,14 +194,18 @@ for site in ('bigmodel', 'kimi', 'kimi-code', 'minimax'):
         pct = r['used_pct']
         label = WNAMES.get(r['window'], r['window'])
         if pct is not None:
-            # 240x16 大进度条图（菜单中放大显示更清晰），按站点着色
-            bar_png = draw_bar(pct, 240, height=16, site=site, radius=0)
-            detail = ''
-            if r.get('total'):
-                detail = '  ' + format(r['used'], '.0f') + '/' + format(r['total'], '.0f')
-            # 图片行：title 占位 + | image=<base64>
-            print(' ' + ' | image=' + b64(bar_png))
-            print('   ' + format(pct, '5.1f') + '%  ' + label + detail + ' | size=12 color=#d6d3cc')
+            if r.get('unlimited'):
+                # MiniMax 周限额无限制：显示 ∞ + 仍画 100% 满色条
+                bar_png = draw_bar(pct, 240, height=16, site=site, radius=0)
+                print(' ' + ' | image=' + b64(bar_png))
+                print('   ' + format(pct, '5.1f') + '%  ' + label + '  ∞ 无限制' + ' | size=12 color=#d6d3cc')
+            else:
+                bar_png = draw_bar(pct, 240, height=16, site=site, radius=0)
+                detail = ''
+                if r.get('total'):
+                    detail = '  ' + format(r['used'], '.0f') + '/' + format(r['total'], '.0f')
+                print(' ' + ' | image=' + b64(bar_png))
+                print('   ' + format(pct, '5.1f') + '%  ' + label + detail + ' | size=12 color=#d6d3cc')
         elif r.get('used') and r['window'] == 'billing':
             buf = label + ': 近30天 ' + format(r['used']/1e6, '.0f') + 'M tokens'
             print(buf + ' | font=Menlo size=12 color=#8a8680')

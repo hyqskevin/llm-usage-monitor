@@ -24,14 +24,15 @@ WINDOWS = {'5h': '5小时额度', 'week': '周额度', 'billing': '账期/订阅
 def load():
     conn = sqlite3.connect(DB)
     rows = conn.execute(
-        'SELECT ts, site, window, used_pct, used, total, remaining, reset_at '
+        'SELECT ts, site, window, used_pct, used, total, remaining, reset_at, unlimited '
         'FROM snapshots ORDER BY ts').fetchall()
     conn.close()
     data = {}
-    for ts, site, window, pct, used, total, remaining, reset_at in rows:
+    for ts, site, window, pct, used, total, remaining, reset_at, unlimited in rows:
         data.setdefault(site, {}).setdefault(window, []).append({
             'ts': ts, 'pct': pct, 'used': used, 'total': total,
             'remaining': remaining, 'reset_at': reset_at,
+            'unlimited': bool(unlimited),
         })
     return data
 
@@ -145,9 +146,9 @@ for (const [site, meta] of Object.entries(SITES)) {{
     const pct = last.pct;
     const uidStr = site + '-' + w + '-' + (++uid);
     cards += `<div class="card">
-      <div class="w"><span>${{wname}}</span><span class="pct">${{pct == null ? '—' : pct.toFixed(1) + '%'}}</span></div>
+      <div class="w"><span>${{wname}}</span><span class="pct">${{last.unlimited ? '∞ 无限制' : (pct == null ? '—' : pct.toFixed(1) + '%')}}</span></div>
       <svg class="bar-svg" viewBox="0 0 360 28" preserveAspectRatio="none"
-           data-uid="${{site}}-${{w}}" data-pct="${{pct == null ? 0 : pct}}" data-c="${{meta.color}}" data-d="${{meta.dark}}">
+           data-uid="${{site}}-${{w}}" data-pct="${{last.unlimited ? 100 : (pct == null ? 0 : pct)}}" data-c="${{meta.color}}" data-d="${{meta.dark}}">
         <defs>
           <linearGradient id="gr-${{site}}-${{w}}" x1="0" x2="1" y1="0" y2="0">
             <stop offset="0%" stop-color="${{meta.color}}"/>
@@ -166,7 +167,7 @@ for (const [site, meta] of Object.entries(SITES)) {{
         <circle class="knob" cx="0" cy="14" r="6" fill="#fff" stroke="${{meta.dark}}" stroke-width="2"/>
         <text class="lbl" x="12" y="18" font-size="12" fill="#4a4a48" font-weight="600">已用</text>
         <text class="val" x="348" y="18" text-anchor="end" font-size="13"
-              fill="#4a4a48" font-weight="700">${{pct == null ? '—' : pct.toFixed(1) + '%'}}</text>
+              fill="#4a4a48" font-weight="700">${{last.unlimited ? '∞' : (pct == null ? '—' : pct.toFixed(1) + '%')}}</text>
       </svg>
       <div class="d"><span>${{last.total ? '<b>' + Math.round(last.used).toLocaleString() + '</b> / ' + Math.round(last.total).toLocaleString() + ' 积分' : (w === 'billing' && last.used ? '近30天 <b>' + fmtBig(last.used) + '</b> tokens' : '&nbsp;')}}</span><span>重置 ${{fmtReset(last.reset_at)}}</span></div>
     </div>`;
