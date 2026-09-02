@@ -214,9 +214,9 @@ for site in ('bigmodel', 'kimi', 'kimi-code', 'minimax'):
     else:
         parts.append(NAMES[site] + '?')
 title_suffix = ' ⚠️' if errors else ''
-# header 第一行：纯图片图标（标题为空字符串时 SwiftBar 显示图片）
-print('| image=' + b64(icon_png))
-# header 第二行（可选，轮播）：文字百分比
+# header 第一行：base64 当 title + size 控制菜单栏显示高度
+print(b64(icon_png) + ' | size=14')
+# header 第二行（轮播）：文字百分比
 print(' '.join(parts) + title_suffix + ' | size=13 dropdown=false')
 
 # ============= 下拉菜单 =============
@@ -241,8 +241,8 @@ for site in ('bigmodel', 'kimi', 'kimi-code', 'minimax'):
             detail = ''
             if r.get('total'):
                 detail = '  ' + format(r['used'], '.0f') + '/' + format(r['total'], '.0f')
-            # 图片行（title 为空时 SwiftBar 显示图片）
-            print('| image=' + b64(bar_png))
+            # 图片行：base64 当 title + templateImage=false
+            print(b64(bar_png) + ' | templateImage=false')
             print('   ' + format(pct, '5.1f') + '%  ' + label + detail + ' | size=12 color=#d6d3cc')
         elif r.get('used') and r['window'] == 'billing':
             buf = label + ': 近30天 ' + format(r['used']/1e6, '.0f') + 'M tokens'
