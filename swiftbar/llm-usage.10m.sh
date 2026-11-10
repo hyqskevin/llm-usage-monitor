@@ -10,7 +10,17 @@
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY="/Users/hanamaki_mac_mini/.workbuddy/binaries/python/versions/3.13.12/bin/python3"
 
-JSON=$("$PY" "$ROOT/fetch.py" --json 2>/dev/null)
+# 2026-11-10 改：不再自己跑 fetch.py，改为直接读 data/latest.json。
+#
+# 原因：v2 插件（llm-usage-v2.10m.sh）是 streamable 常驻进程，每 10 分钟采集一次。
+# 两个插件都跑 fetch.py 会抢同一个 flock 锁：
+#   - 后启动的那个拿不到锁 → 输出为空 → SwiftBar 判定插件异常（一直 Loading）
+#   - 且两边各起一轮 Playwright，白白拖慢刷新
+#
+# 现在由 v2 负责采集并落盘 latest.json，v1 只读快照，
+# 两个插件并存但互不冲突，且状态栏数据保持一致。
+JSON=$(cat "$ROOT/data/latest.json" 2>/dev/null)
+[ -z "$JSON" ] && JSON=$("$PY" "$ROOT/fetch.py" --json 2>/dev/null)
 [ -z "$JSON" ] && JSON=$(cat "$ROOT/data/latest.json" 2>/dev/null)
 
 "$PY" - "$JSON" "$ROOT" <<'PYEOF'
