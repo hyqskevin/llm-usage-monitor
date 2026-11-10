@@ -40,14 +40,39 @@ def load_auth():
 
 
 def refresh_auth():
-    """鉴权过期时用无头浏览器从持久化 profile 重新导出 cookies 与请求头"""
+    """鉴权过期时用无头浏览器从持久化 profile 重新导出 cookies 与请求头。
+
+    2026-09-24 修：原先子进程输出被丢弃、returncode 不检查，导致「浏览器二进制缺失」
+    与「token 过期」报同一个错，排查时无法区分。现在失败会打印 stderr 尾部。
+    返回失败脚本名列表（空列表 = 全部成功）。
+    """
     import subprocess
     env = dict(os.environ,
                NODE_PATH='/Users/hanamaki_mac_mini/.workbuddy/binaries/node/workspace/node_modules')
-    node = '/Users/hanamaki_mac_mini/.workbuddy/binaries/node/versions/22.22.2-2/bin/node'
-    for s in ('dump_cookies.js', 'discover_api.js'):
-        subprocess.run([node, os.path.join(ROOT, 'scripts', s)],
-                       cwd=ROOT, env=env, capture_output=True, timeout=120)
+    node = '/opt/homebrew/bin/node'
+    failed = []
+    # minimax_refresh_auth.js 是非交互的（复用已登录 profile 刷新会话），
+    # 若 profile 登录态已失效它会 exit 2 并提示需人工登录。
+    for s in ('dump_cookies.js', 'discover_api.js', 'mimo_refresh_session.js',
+              'minimax_refresh_auth.js'):
+        try:
+            p = subprocess.run([node, os.path.join(ROOT, 'scripts', s)],
+                               cwd=ROOT, env=env, capture_output=True, timeout=120)
+            if p.returncode != 0:
+                tail = p.stderr.decode(errors='replace').strip()[-400:]
+                print(f'  ⚠️ refresh_auth: {s} 退出码 {p.returncode}', file=sys.stderr)
+                if tail:
+                    print(f'     {tail}', file=sys.stderr)
+                # 浏览器二进制缺失/版本错配是最常见的根因，给出可执行的修复命令
+                if "Executable doesn't exist" in tail or 'playwright install' in tail:
+                    print('     ↳ Playwright 浏览器版本与库不匹配，修复命令：', file=sys.stderr)
+                    print('       cd ~/.workbuddy/binaries/node/workspace && '
+                          'node node_modules/playwright-core/cli.js install chromium', file=sys.stderr)
+                failed.append(s)
+        except Exception as e:
+            print(f'  ⚠️ refresh_auth: {s} 执行异常 {e}', file=sys.stderr)
+            failed.append(s)
+    return failed
 
 
 def cookie_header(cookies, domain):
@@ -56,6 +81,82 @@ def cookie_header(cookies, domain):
 
 def pick_headers(req, keys):
     return {k: v for k, v in req['headers'].items() if k in keys}
+
+
+# ---------- 鉴权预检 ----------
+
+# 各站点「鉴权失效」的判定依据：接口返回 HTTP 200 但 body 里带 code/msg 错误，
+# 或直接 401/403。命中即视为 token 失效，不再重试刷新（刷新对已失效会话无效）。
+AUTH_ERROR_CODES = ('登录状态已过期', 'unauthorized', 'token expired', '登录已失效')
+
+
+def is_auth_error(exc):
+    """判断异常是否属于「鉴权失效」而非「网络/解析异常」。"""
+    msg = str(exc).lower()
+    if 'http error 401' in msg or 'http error 403' in msg:
+        return True
+    return any(k in msg for k in AUTH_ERROR_CODES)
+
+
+def token_fingerprint(reqs, site):
+    """取某站点当前 authorization 的指纹，用于判断「刷新是否真的换了新 token」。
+
+    返回短哈希而非原文，避免把凭证写进日志。
+    """
+    import hashlib
+    try:
+        auth = reqs[site][0]['headers'].get('authorization', '')
+    except (KeyError, IndexError, TypeError):
+        return None
+    if not auth:
+        return None
+    return hashlib.sha1(auth.encode()).hexdigest()[:10]
+
+
+def refresh_auth_for(site, reqs):
+    """对单个站点尝试刷新鉴权。
+
+    2026-11-10 修：原实现对所有站点统一跑一遍 refresh_auth()（4 个 Playwright 脚本），
+    但每个站点的鉴权来源不同——bigmodel/kimi 靠 api-requests.json 的 authorization，
+    minimax 靠 minimax-auth.json，mimo 靠 mimo-session.json。
+    全量刷新既慢（每次起 4 个浏览器）又可能用「同样失效的旧 token」覆盖新值。
+
+    这里改为按站点最小化刷新，并校验刷新前后的 token 指纹：
+      - 指纹变化 → 刷新成功
+      - 指纹不变 → 说明刷新生效但拿到同一个（仍失效的）token，不算成功
+    """
+    import subprocess
+    env = dict(os.environ,
+               NODE_PATH='/Users/hanamaki_mac_mini/.workbuddy/binaries/node/workspace/node_modules')
+    node = '/opt/homebrew/bin/node'
+    # 站点 → 负责刷新其鉴权的脚本
+    SCRIPTS = {
+        'bigmodel': ['discover_api.js'],      # 抓 bigmodel 的 authorization
+        'kimi': ['discover_api.js'],           # 抓 kimi 的 authorization（同脚本含两站）
+        'minimax': ['minimax_refresh_auth.js'],
+        'mimo': ['mimo_refresh_session.js'],
+        'deepseek': ['deepseek_discover.js'],
+    }
+    before = token_fingerprint(reqs, site)
+    for s in SCRIPTS.get(site, []):
+        try:
+            p = subprocess.run([node, os.path.join(ROOT, 'scripts', s)],
+                               cwd=ROOT, env=env, capture_output=True, timeout=120)
+            if p.returncode != 0:
+                tail = p.stderr.decode(errors='replace').strip()[-200:]
+                print(f'  ⚠️ 刷新 {site}: {s} 退出码 {p.returncode}'
+                      + (f' | {tail}' if tail else ''), file=sys.stderr)
+        except Exception as e:
+            print(f'  ⚠️ 刷新 {site}: {s} 执行异常 {e}', file=sys.stderr)
+    after = token_fingerprint(load_auth()[1], site)
+    if after is None:
+        return False
+    if before is not None and after == before:
+        # 刷新没换出新 token —— 多半是会话本身已失效，必须人工重登
+        print(f'  ⚠️ {site} 刷新后 token 未变化（指纹 {after}），会话可能已彻底失效',
+              file=sys.stderr)
+        return False
+    return True
 
 
 # ---------- 各站点解析 ----------
@@ -98,10 +199,11 @@ def fetch_kimi(reqs):
         raise RuntimeError(f'kimi auth failed: {str(resp)[:120]}')
     kimi, code = [], []
     rl5, rl7 = resp['ratelimitCode5h'], resp['ratelimitCode7d']
-    code.append({'window': '5h', 'used_pct': rl5['ratio'] * 100,
+    # 用量为 0（窗口刚重置）时 Kimi 会省略 ratio 字段，缺失按 0 处理
+    code.append({'window': '5h', 'used_pct': rl5.get('ratio', 0.0) * 100,
                  'used': None, 'total': None, 'remaining': None,
                  'reset_at': rl5.get('resetTime')})
-    code.append({'window': 'week', 'used_pct': rl7['ratio'] * 100,
+    code.append({'window': 'week', 'used_pct': rl7.get('ratio', 0.0) * 100,
                  'used': None, 'total': None, 'remaining': None,
                  'reset_at': rl7.get('resetTime')})
     bal = resp.get('subscriptionBalance') or {}
@@ -117,10 +219,31 @@ def fetch_kimi(reqs):
 
 
 def fetch_minimax(cookies):
-    h = {'Cookie': cookie_header(cookies, 'minimaxi.com'), 'Accept': 'application/json'}
-    resp = http('GET', 'https://www.minimaxi.com/backend/account/token_plan/remains_percent', h)
-    if resp.get('base_resp', {}).get('status_code') != 0:
+    """MiniMax Token Plan 用量。
+
+    鉴权是「登录会话 cookie + 额外 API key 头」两层，缺任一层都会失败，
+    但两层的错误码不同（2026-10-23 实测）：
+      1004 cookie is missing, log in again  → 缺登录会话 cookie
+      1016 invalid api key                    → 缺额外 API key 头
+
+    cookie 优先取 data/minimax-auth.json（scripts/minimax_login.js 登录后落盘，
+    含完整 cookie 与鉴权头），缺失时回退到 data/cookies.json 的域分组。
+    """
+    ck, extra_headers = _minimax_auth(cookies)
+    h = {'Cookie': ck, 'Accept': 'application/json',
+         'Referer': 'https://platform.minimax.cn/console/usage'}
+    h.update(extra_headers)
+
+    resp = http('GET', 'https://www.minimax.cn/backend/account/token_plan/remains_percent', h)
+    code = resp.get('base_resp', {}).get('status_code')
+    if code != 0:
+        msg = resp.get('base_resp', {}).get('status_msg', '')
+        if code == 1004:
+            raise RuntimeError('minimax 未登录（cookie 缺失），需重新登录: node scripts/minimax_login.js')
+        if code == 1016:
+            raise RuntimeError('minimax 缺少 API key 头，需重新登录抓取鉴权: node scripts/minimax_login.js')
         raise RuntimeError(f"minimax auth failed: {str(resp)[:120]}")
+
     out = []
     models = resp.get('model_remains') or []
     if models:
@@ -147,7 +270,7 @@ def fetch_minimax(cookies):
             })
     # 月度：用 usage_summary 的 daily_token_usage 聚合当月消耗
     try:
-        s = http('GET', 'https://www.minimaxi.com/backend/account/token_plan/usage_summary', h)
+        s = http('GET', 'https://www.minimax.cn/backend/account/token_plan/usage_summary', h)
         daily = s.get('daily_token_usage') or []
         if daily:
             month_tokens = sum(daily[-30:])
@@ -156,6 +279,199 @@ def fetch_minimax(cookies):
     except Exception:
         pass
     return out
+
+
+def _minimax_auth(cookies):
+    """返回 (cookie 串, 额外鉴权头)。
+
+    优先 data/minimax-auth.json（登录脚本落盘，含鉴权头），
+    回退 data/cookies.json 的 minimax.cn / minimaxi.com 域分组。
+    """
+    auth_path = os.path.join(ROOT, 'data', 'minimax-auth.json')
+    if os.path.exists(auth_path):
+        try:
+            auth = json.load(open(auth_path))
+            cs = auth.get('cookies') or []
+            if cs:
+                ck = '; '.join(f"{c['name']}={c['value']}" for c in cs)
+                return ck, (auth.get('auth_headers') or {})
+        except Exception:
+            pass
+    ck = (cookie_header(cookies, 'minimax.cn') or cookie_header(cookies, 'minimaxi.com'))
+    return ck, {}
+
+
+# load_budget 已废弃：DeepSeek 区块去掉预算逻辑，账户余额直接展示。
+# 旧函数保留注释避免后续误删：
+# def load_budget(): ... (2026-09-15 21:15 移除)
+
+
+def fetch_deepseek(reqs):
+    """DeepSeek 用量：充值余额 / 当日消费金额 / 当日 token。
+
+    实现方式：调子进程跑 scripts/deepseek_discover.js —— Playwright 复用已登录 profile
+    (含 localStorage isAuthenticated:true)，从 platform.deepseek.com 三个内部 API 抓数据：
+      - /api/v0/users/get_user_summary        → 充值余额 + 累计消费
+      - /api/v0/usage/by_api_key/amount       → 当日 token
+      - /api/v0/usage/by_api_key/cost         → 当日消费金额
+    解析后写到 data/deepseek-rows.json，fetch.py 读这个文件。
+
+    返回 rows：
+      [
+        {'site': 'deepseek', 'window': 'billing', 'used': 累计消费, 'total': 充值总额,
+         'remaining': 余额, 'used_pct': None, 'reset_at': None, 'unlimited': False,
+         'meta': {'monthly_budget_cny': 50.0}},
+        {'site': 'deepseek', 'window': 'today',   'used': 当日消费, 'total': None,
+         'remaining': None, 'used_pct': None, 'reset_at': None, 'unlimited': False,
+         'meta': {'today_tokens': N, 'monthly_budget_cny': 50.0}},
+      ]
+    """
+    import subprocess
+    rows_path = os.path.join(ROOT, 'data', 'deepseek-rows.json')
+
+    # 注意：不依赖 reqs['deepseek'] —— discover_api.js 在鉴权失败被自动重跑时会覆盖 deepseek 数组为 []，
+    # 但 deepseek 的真实抓包由 deepseek_discover.js 自己负责，子进程通过 Playwright persistent context
+    # 复用登录态（localStorage isAuthenticated:true），不依赖 api-requests.json 里的 deepseek 数组。
+
+    env = dict(os.environ,
+               NODE_PATH='/Users/hanamaki_mac_mini/.workbuddy/binaries/node/workspace/node_modules')
+    node = '/opt/homebrew/bin/node'
+    proc = subprocess.run(
+        [node, os.path.join(ROOT, 'scripts', 'deepseek_discover.js')],
+        cwd=ROOT, env=env, capture_output=True, timeout=120,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f'deepseek_discover.js 退出码 {proc.returncode}: '
+                           f'{proc.stderr.decode(errors="replace")[-500:]}')
+    if not os.path.exists(rows_path):
+        raise RuntimeError('deepseek_discover.js 未生成 deepseek-rows.json')
+
+    payload = json.load(open(rows_path))
+    out_rows = []
+    for r in payload.get('rows', []):
+        out_rows.append({'site': 'deepseek', **r})
+    if payload.get('errors'):
+        import warnings
+        warnings.warn('deepseek 部分失败: ' + '; '.join(payload['errors']))
+    if not out_rows:
+        raise RuntimeError('deepseek rows 为空: ' + '; '.join(payload.get('errors', [])))
+    return out_rows
+
+
+def fetch_mimo():
+    """MiMo 套餐用量：账期 Credits 用量 + 当日 tokens/请求数（纯 HTTP，cookie 鉴权）。
+
+    鉴权链路（2026-10-13 踩坑记录）：
+      - platform.xiaomimimo.com 的会话 cookie（api-platform_serviceToken 等）是
+        session 级、不落盘；由持久化 profile 里的长效 passToken（.account.xiaomi.com）
+        经 /sts 握手签发。scripts/mimo_refresh_session.js 负责握手并导出
+        data/mimo-session.json，过期后 refresh_auth() 会自动重新签发。
+      - POST /api/v1/usage/token-plan/list 必须带 ?api-platform_ph=<值>，且该值要
+        用 cookie 原值「去掉字面引号」后再 URL 编码——cookie 里存的值自带双引号，
+        直接拼 URL 会稳定 401（loginUrl 里能看到 %2522 的痕迹）。
+
+    返回 rows：
+      [
+        {'site': 'mimo', 'window': 'billing', 'used_pct': 账期已用%, 'used': 已用 credits,
+         'total': 套餐月总量, 'remaining': 剩余, 'reset_at': 账期结束时间,
+         'meta': {'plan': ..., 'auto_renew': ..., 'month_pct': 当月已用%}},
+        {'site': 'mimo', 'window': 'today', 'used': 当日 tokens, 'used_pct': None,
+         'meta': {'today_tokens': N, 'today_requests': N, 'models': [...]}},
+      ]
+    """
+    import urllib.parse
+    from datetime import timedelta
+
+    sess_path = os.path.join(ROOT, 'data', 'mimo-session.json')
+    if not os.path.exists(sess_path):
+        raise RuntimeError('mimo-session.json 不存在，请运行: node scripts/mimo_refresh_session.js')
+    sess = json.load(open(sess_path))
+    cookies = sess.get('cookies', {}).get('xiaomimimo.com', [])
+    ck = '; '.join(f"{c['name']}={c['value']}" for c in cookies)
+    ph_raw = next((c['value'] for c in cookies if c['name'] == 'api-platform_ph'), None)
+    if not ck or ph_raw is None:
+        raise RuntimeError('mimo 会话 cookie 缺失（无 serviceToken/ph）')
+
+    base = 'https://platform.xiaomimimo.com'
+    h = {'Cookie': ck, 'Accept': 'application/json', 'content-type': 'application/json',
+         'x-timezone': 'Asia/Shanghai', 'accept-language': 'zh',
+         'referer': f'{base}/console/plan-manage?edition=PERSONAL'}
+
+    def api(method, path, body=None):
+        resp = http(method, base + path, h, body)
+        if resp.get('code') != 0:
+            raise RuntimeError(f"mimo auth failed: {str(resp)[:120]}")
+        return resp.get('data')
+
+    usage = api('GET', '/api/v1/tokenPlan/usage')
+    detail = api('GET', '/api/v1/tokenPlan/detail') or {}
+
+    out = []
+    items = {i['name']: i for i in (usage.get('usage') or {}).get('items', [])}
+    plan = items.get('plan_total_token')
+    if not plan or not plan.get('limit'):
+        raise RuntimeError(f'mimo tokenPlan/usage 缺 plan_total_token: {str(usage)[:120]}')
+    used, limit = float(plan['used']), float(plan['limit'])
+
+    reset_at = None
+    if detail.get('currentPeriodEnd'):
+        # 页面给的是北京时间字符串 "2026-11-13 23:59:59"
+        reset_at = detail['currentPeriodEnd'].replace(' ', 'T') + '+08:00'
+    month = (usage.get('monthUsage') or {}).get('percent')
+    comp = items.get('compensation_total_token') or {}
+    out.append({
+        'window': 'billing',
+        'used_pct': used / limit * 100 if limit else None,
+        'used': used, 'total': limit, 'remaining': limit - used,
+        'reset_at': reset_at,
+        'meta': {'plan': detail.get('planName'),
+                 'auto_renew': bool(detail.get('enableAutoRenew')),
+                 'month_pct': month * 100 if month is not None else None,
+                 'compensation_used': comp.get('used'), 'compensation_limit': comp.get('limit')},
+    })
+
+    # 当日用量：POST usage/token-plan/list 按 (date, model) 返回每日明细
+    ph = ph_raw.strip('"')
+    now_local = datetime.now(timezone(timedelta(hours=8)))
+    daily = api('POST', '/api/v1/usage/token-plan/list?' + urllib.parse.urlencode({'api-platform_ph': ph}),
+                {'year': now_local.year, 'month': now_local.month}) or []
+    today_str = now_local.strftime('%Y-%m-%d')
+    todays = [d for d in daily if d.get('date') == today_str]
+    out.append({
+        'window': 'today',
+        'used_pct': None,
+        'used': float(sum(d.get('totalToken') or 0 for d in todays)),
+        'total': None, 'remaining': None, 'reset_at': None,
+        'meta': {'today_tokens': sum(d.get('totalToken') or 0 for d in todays),
+                 'today_requests': sum(d.get('requestCount') or 0 for d in todays),
+                 'models': sorted({d.get('model') for d in todays if d.get('model')})},
+    })
+    return out
+
+
+# ---------- 并发保护 ----------
+
+def _acquire_lock():
+    """非阻塞排他锁，防止采集任务重叠执行。
+
+    背景（2026-09-24 踩坑）：SwiftBar 每 10 分钟触发一次 fetch.py，而抓 deepseek /
+    刷新 kimi 鉴权都要起 Playwright 实例。若上一轮尚未结束，两个 Chromium 会同时
+    读写同一个 browser-profile，导致「请求头丢失、API 响应缺失」，表现为随机站点失败。
+
+    用 fcntl.flock：进程退出（含被 kill / 崩溃）时由内核自动释放，不会留下死锁文件。
+    返回值需在调用方作用域内保持引用，否则文件对象被回收会提前释放锁。
+    """
+    import fcntl
+    lock_path = os.path.join(ROOT, 'data', '.fetch.lock')
+    fp = open(lock_path, 'w')
+    try:
+        fcntl.flock(fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fp.close()
+        return None
+    fp.write(str(os.getpid()))
+    fp.flush()
+    return fp
 
 
 # ---------- 存储 ----------
@@ -169,58 +485,171 @@ def init_db(conn):
         used_pct REAL, used REAL, total REAL, remaining REAL, reset_at TEXT,
         unlimited INTEGER DEFAULT 0
     )''')
-    # 兼容旧表：如果 unlimited 列不存在则加上
+    # 兼容旧表：如果 unlimited / meta 列不存在则加上
     cols = {r[1] for r in conn.execute('PRAGMA table_info(snapshots)').fetchall()}
     if 'unlimited' not in cols:
         conn.execute('ALTER TABLE snapshots ADD COLUMN unlimited INTEGER DEFAULT 0')
+    if 'meta' not in cols:
+        conn.execute('ALTER TABLE snapshots ADD COLUMN meta TEXT')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_ts ON snapshots(ts)')
 
 
 def main():
     json_only = '--json' in sys.argv
+
+    # 防并发重叠：拿不到锁说明另一轮采集正在跑，直接跳过本轮。
+    lock = _acquire_lock()
+    if lock is None:
+        if json_only:
+            # 注意：--json 模式必须保持 stdout 干净——SwiftBar 插件靠「输出为空」回退到
+            # data/latest.json；若这里往 stdout 写字，插件会拿到非 JSON 文本而报错。
+            print('另一轮采集正在进行，跳过本次', file=sys.stderr)
+        else:
+            print('另一轮采集正在进行，跳过本次')
+        return
+
     cookies, reqs = load_auth()
     ts = datetime.now(tz=timezone.utc).isoformat()
     rows, errors = [], {}
-    refreshed = False
 
     def collect_kimi():
         kimi_rows, code_rows = fetch_kimi(reqs)
         return [{'site': 'kimi', **i} for i in kimi_rows] + \
                [{'site': 'kimi-code', **i} for i in code_rows]
 
+    # 2026-11-10 改造：原实现用单个 `refreshed` 标志位，任一站点失败就对
+    # **所有**站点跑一遍全量 refresh_auth()（4 个 Playwright 脚本，~40 秒），
+    # 且刷新后不复核结果——于是「会话已彻底失效」时每轮都白跑一遍浏览器，
+    # 并把同样失效的旧 token 继续写回，形成永久性失败循环。
+    #
+    # 新逻辑：
+    #   1. 只对失败的那个站点做最小化刷新（见 refresh_auth_for）
+    #   2. 用 token 指纹校验刷新是否真的换了新 token
+    #   3. 鉴权类错误不重试（重试无意义，直接报「需人工重登」）
+    #   4. 连续多轮鉴权失败的站点进入熔断，跳过昂贵的浏览器刷新
+    DEAD_AUTH_TTL = 3600          # 熔断状态保存时长
+    DEAD_AUTH_THRESHOLD = 3       # 连续失败几轮后熔断
+    dead_path = os.path.join(ROOT, 'data', '.dead_auth.json')
+
+    def load_dead():
+        try:
+            with open(dead_path) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def save_dead(d):
+        try:
+            with open(dead_path, 'w') as f:
+                json.dump(d, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    dead = load_dead()
+    now_ts = time.time()
+    # 清理过期熔断记录
+    dead = {k: v for k, v in dead.items() if now_ts - v.get('at', 0) < DEAD_AUTH_TTL}
+
     for site, fn in (('bigmodel', lambda: [{'site': 'bigmodel', **i} for i in fetch_bigmodel(reqs)]),
                      ('kimi', collect_kimi),
-                     ('minimax', lambda: [{'site': 'minimax', **i} for i in fetch_minimax(cookies)])):
+                     ('minimax', lambda: [{'site': 'minimax', **i} for i in fetch_minimax(cookies)]),
+                     ('mimo', lambda: [{'site': 'mimo', **i} for i in fetch_mimo()]),
+                     ('deepseek', lambda: [{'site': 'deepseek', **i} for i in fetch_deepseek(reqs)])):
+        rec = dead.get(site)
+        # tripped=True 表示已熔断：跳过昂贵的浏览器刷新，直接采一次看是否已恢复
+        is_tripped = bool(rec and rec.get('tripped'))
+        if is_tripped:
+            try:
+                rows.extend(fn())
+                # 恢复成功 → 解除熔断
+                dead.pop(site, None)
+                save_dead(dead)
+                continue
+            except Exception as e:
+                # 熔断期内仍然失败：刷新时间戳以延长熔断窗口，计数继续累加
+                errors[site] = str(e)
+                rec = dead.get(site) or {}
+                rec['count'] = rec.get('count', 0) + 1
+                rec['at'] = now_ts
+                dead[site] = rec
+                save_dead(dead)
+                continue
+
         for attempt in range(2):
             try:
                 rows.extend(fn())
+                # 采集成功 → 清掉该站点的失败计数
+                if site in dead:
+                    dead.pop(site, None)
+                    save_dead(dead)
                 break
             except Exception as e:
-                if attempt == 0 and not refreshed:
-                    # 鉴权可能过期，无头浏览器刷新后重试一次
+                auth_bad = is_auth_error(e)
+                if attempt == 0 and not auth_bad:
+                    # 非鉴权类错误（网络/解析）→ 刷新鉴权后重试一次
                     try:
-                        refresh_auth()
+                        refresh_auth_for(site, reqs)
                         cookies, reqs = load_auth()
-                        refreshed = True
                         continue
                     except Exception:
                         pass
-                errors[site] = str(e)
+                if auth_bad:
+                    # 鉴权失效：刷新只对「浏览器会话仍有效但 token 过期」有用。
+                    # 这里做一次最小化刷新并用指纹校验，失败则判定需人工重登。
+                    try:
+                        if refresh_auth_for(site, reqs):
+                            cookies, reqs = load_auth()
+                            rows.extend(fn())
+                            dead.pop(site, None)
+                            save_dead(dead)
+                            break
+                    except Exception as e2:
+                        errors[site] = str(e2)
+                    if site not in errors:
+                        errors[site] = str(e) + '（需人工重登：点菜单「重新登录（浏览器）」）'
+                    # 累计失败次数，达到阈值才熔断
+                    prev = dead.get(site) or {}
+                    cnt = prev.get('count', 0) + 1
+                    rec = {'count': cnt, 'at': now_ts, 'reason': str(e)[:120]}
+                    if cnt >= DEAD_AUTH_THRESHOLD:
+                        rec['tripped'] = True
+                        print(f'  ⚠️ {site} 连续 {cnt} 轮鉴权失败，已熔断 1 小时（跳过浏览器刷新）',
+                              file=sys.stderr)
+                    else:
+                        print(f'  ⚠️ {site} 鉴权失败（第 {cnt}/{DEAD_AUTH_THRESHOLD} 轮），'
+                              '建议尽快人工重登', file=sys.stderr)
+                    dead[site] = rec
+                    save_dead(dead)
+                else:
+                    errors[site] = str(e)
                 break
+
+    save_dead(dead)
 
     conn = sqlite3.connect(DB)
     init_db(conn)
     for r in rows:
         conn.execute(
-            'INSERT INTO snapshots(ts, site, window, used_pct, used, total, remaining, reset_at, unlimited)'
-            ' VALUES (?,?,?,?,?,?,?,?,?)',
+            'INSERT INTO snapshots(ts, site, window, used_pct, used, total, remaining, reset_at, unlimited, meta)'
+            ' VALUES (?,?,?,?,?,?,?,?,?,?)',
             (ts, r['site'], r['window'], r['used_pct'], r['used'], r['total'],
-             r['remaining'], r['reset_at'], int(r.get('unlimited', False))))
+             r['remaining'], r['reset_at'], int(r.get('unlimited', False)),
+             json.dumps(r.get('meta'), ensure_ascii=False) if r.get('meta') else None))
     conn.commit()
 
     latest = {'ts': ts, 'rows': rows, 'errors': errors}
     with open(os.path.join(ROOT, 'data', 'latest.json'), 'w') as f:
         json.dump(latest, f, ensure_ascii=False, indent=2)
+
+    # 重新生成仪表盘 HTML：SwiftBar 菜单「打开仪表盘」直接读该文件，
+    # 不刷新的话打开的是上一次采集的旧快照。
+    try:
+        if ROOT not in sys.path:
+            sys.path.insert(0, ROOT)
+        import dashboard
+        dashboard.generate()
+    except Exception as e:
+        print(f'  ⚠️ dashboard 生成失败: {e}', file=sys.stderr)
 
     if json_only:
         print(json.dumps(latest, ensure_ascii=False))
@@ -236,6 +665,25 @@ def main():
             extra = f" ({r['used']:.0f}/{r['total']:.0f}, 剩 {r['remaining']:.0f})"
         elif r['used'] and r['window'] == 'billing':
             extra = f" (近30天 {r['used']/1e6:.0f}M tokens)"
+        # DeepSeek 余额模式：直接显示 余额/总额 + 当日消费金额
+        if r['site'] == 'deepseek':
+            if r['window'] == 'billing':
+                extra = f" (余额 ¥{r['remaining']:.2f} / 总额 ¥{r['total']:.2f}, 已消费 ¥{r['used']:.2f})"
+            elif r['window'] == 'today':
+                meta = r.get('meta') or {}
+                tok = meta.get('today_tokens')
+                extra = f" ¥{r['used']:.2f}"
+                if tok is not None:
+                    extra += f"  ({tok/1e6:.1f}M tokens)"
+        if r['site'] == 'mimo':
+            if r['window'] == 'billing' and r['total']:
+                extra = (f" ({r['used']/1e6:.0f}M/{r['total']/1e6:.0f}M credits"
+                         f", 剩 {r['remaining']/1e6:.0f}M)")
+            elif r['window'] == 'today':
+                meta = r.get('meta') or {}
+                tok = meta.get('today_tokens')
+                reqn = meta.get('today_requests')
+                extra = f" ({tok/1e6:.1f}M tokens, {reqn} 次请求)" if tok is not None else ''
         print(f"  {r['site']:9s} {r['window']:8s} 已用 {pct}{extra}")
     for site, err in errors.items():
         print(f"  {site}: 失败 - {err}")
