@@ -166,7 +166,18 @@ def fetch_bigmodel(reqs):
     h = pick_headers(r, ('authorization', 'bigmodel-organization', 'bigmodel-project'))
     resp = http('GET', r['url'], h)
     if resp.get('code') != 200:
+        # 2026-11-10：尝试从用户日常 Chrome 导入的鉴权材料兜底。
+        # 智谱是双因子鉴权——authorization(JWT) + 605ea18895037d16 会话 cookie，
+        # 缺任一都 401。只靠脚本专用 browser-profile 抓包时，两者是割裂的，
+        # 而用户日常 Chrome 往往一直是登录态。
+        chrome = _bigmodel_from_chrome(r)
+        if chrome is not None:
+            return chrome
         raise RuntimeError(f"bigmodel auth failed: {resp.get('msg')}")
+    return _parse_bigmodel_limits(resp)
+
+
+def _parse_bigmodel_limits(resp):
     out = []
     for lim in resp['data']['limits']:
         # unit=3 按小时(number=5→5h), unit=6 按周(number=1→week)
@@ -186,6 +197,53 @@ def fetch_bigmodel(reqs):
             'reset_at': datetime.fromtimestamp(reset / 1000, tz=timezone.utc).isoformat() if reset else None,
         })
     return out
+
+
+def _bigmodel_from_chrome(req):
+    """用 Chrome 导入的鉴权材料抓 bigmodel 用量；不可用时返回 None。
+
+    数据来源：data/chrome_auth.json（由 scripts/chrome_cookie_import.py 生成）。
+    若该文件不存在或内容已过期，尝试现场重新导入一次。
+    """
+    import subprocess
+    path = os.path.join(ROOT, 'data', 'chrome_auth.json')
+    payload = None
+    for attempt in range(2):
+        try:
+            with open(path) as f:
+                payload = json.load(f)
+            break
+        except Exception:
+            payload = None
+            if attempt == 0:
+                # 现场从 Chrome 导入一次（会读 Keychain，可能弹授权框）
+                try:
+                    subprocess.run(
+                        [sys.executable, os.path.join(ROOT, 'scripts', 'chrome_cookie_import.py')],
+                        cwd=ROOT, capture_output=True, timeout=120)
+                except Exception:
+                    pass
+    if not payload:
+        return None
+    cookies = payload.get('cookies') or {}
+    token = cookies.get('bigmodel_token_production')
+    if not token:
+        return None
+
+    headers = pick_headers(req, ('bigmodel-organization', 'bigmodel-project',
+                                 'referer', 'accept', 'accept-language'))
+    headers['authorization'] = token
+    headers['cookie'] = '; '.join(f'{k}={v}' for k, v in cookies.items())
+    try:
+        resp = http('GET', req['url'], headers)
+    except Exception as e:
+        print(f'  ⚠️ bigmodel Chrome 兜底失败: {e}', file=sys.stderr)
+        return None
+    if resp.get('code') != 200:
+        print(f"  ⚠️ bigmodel Chrome 兜底也被拒: {resp.get('msg')}", file=sys.stderr)
+        return None
+    print('  ✅ bigmodel 已用 Chrome 登录态兜底成功', file=sys.stderr)
+    return _parse_bigmodel_limits(resp)
 
 
 def fetch_kimi(reqs):

@@ -7,3 +7,11 @@ node_modules/
 data/cookies.json
 data/api-requests.json
 data/dashboard.html
+data/mimo-session.json
+data/mimo-requests-raw.json
+data/mimo-probe.json
+data/mimo-probe.png
+data/minimax-probe-*.json
+data/minimax-auth.json
+data/chrome_auth.json
+data/.dead_auth.json

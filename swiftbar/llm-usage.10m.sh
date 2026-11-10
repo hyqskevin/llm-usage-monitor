@@ -464,8 +464,17 @@ if errors:
 print('---')
 print('刷新 | refresh=true')
 print('打开仪表盘 | bash=' + ROOT + '/scripts/open_dashboard.sh terminal=false')
-NODE='/opt/homebrew/bin/node'
-NODEMOD='/Users/hanamaki_mac_mini/.workbuddy/binaries/node/workspace/node_modules'
 # 重新登录：一次性打开全部站点登录页，登录后关闭浏览器即自动保存登录态到 browser-profile/
-print('重新登录（浏览器）| bash=/bin/zsh param0=-c param1="cd ' + ROOT + ' && NODE_PATH=' + NODEMOD + ' ' + NODE + ' scripts/login.js" terminal=true')
+#
+# 2026-11-10 修：原先写的是
+#   bash=/bin/zsh param0=-c param1="cd ... && node scripts/login.js"
+# SwiftBar 的 bash= 语义是「把 bash= 的值当作待执行的脚本」，param0/param1
+# 只是附加参数，不会变成「用 zsh -c 执行 param1」。于是 SwiftBar 去执行
+# /bin/zsh 这个二进制 → cannot execute binary file，浏览器压根没被拉起，
+# 点「重新登录」毫无反应。
+# 正确写法：bash= 指向真实的 shell 脚本（scripts/login.sh），由脚本自己 cd + 调 node。
+print('重新登录（浏览器）| bash=' + ROOT + '/scripts/login.sh terminal=true')
+# 从 Chrome 同步登录态：智谱 GLM 的鉴权是双因子（authorization + 会话 cookie），
+# 抓包只能拿到一半。这里直接读用户日常 Chrome 的 cookie 库补齐，无需人工验证。
+print('从 Chrome 同步登录态 | bash=' + ROOT + '/scripts/sync_chrome_auth.sh terminal=true')
 PYEOF
