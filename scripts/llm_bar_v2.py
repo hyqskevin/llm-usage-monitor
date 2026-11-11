@@ -16,8 +16,10 @@ Python 侧负责：
   - 新旧 provider 之间做交叉淡入淡出，避免突兀
 """
 import base64
+import ctypes
 import json
 import os
+import select as select_mod
 import struct
 import subprocess
 import sys
@@ -31,6 +33,15 @@ LOGO_DIR = os.path.join(ROOT, 'assets', 'logos')
 SWITCH = os.path.join(ROOT, 'scripts', 'switch_model.sh')
 STATE = os.path.join(DATA, 'selected.json')
 LAST_RENDERED = os.path.join(DATA, '.last_rendered.json')
+CLICK_LOG = os.path.join(DATA, '.click_log.jsonl')
+# 菜单项图片左缘相对菜单窗口左缘的 inset（pt）。实测见 /tmp/testmenu/gray。
+MENU_IMG_INSET = 14
+# 条带在菜单正文首行；正文前有「header 行 + separator 行」。
+# NSMenu popup 窗口顶部 padding ≈ 3pt，常规行高 22pt。
+# 推算值仅作 fallback，真实值由菜单打开时的自动标定覆盖（见 calibrate_strip）。
+MENU_BODY_TOP = 3 + 22 + 22
+STRIP_H = 19
+STRIP_Y_TOLERANCE = 8
 FETCH_PY = os.path.join(ROOT, 'fetch.py')
 PY_BIN = sys.executable
 
@@ -170,6 +181,469 @@ def draw_bar(pct, width, height=16, base=None):
     return png_bytes(width, height, bytes(pixels))
 
 
+def draw_logo_strip(active=15, inactive=12, gap=4, pad=2):
+    """下拉菜单顶部的横向 logo 条带：5 个 provider logo 拼成**一张图**。
+
+    为什么拼一张图：NSMenu 的每一行只能放一个菜单项（一个 image=），
+    要「横向排列」只能把所有 logo 画进同一张 PNG。
+
+    交互（2026-11-11 v2 改造，去掉 fold 下拉）：
+      条带是**无 action 的纯图片项**——实测（/tmp/testmenu/gray）disabled 项
+      的 image 不被灰化、保持原色，且点击 disabled 项不会触发任何
+      performItemAction → 菜单不会 dismiss。
+      点击由常驻进程自己探测：CGEventSource 检测真实 leftMouseUp 后，
+      枚举 layer=101 的 SwiftBar 菜单窗口 + 全屏截图像素比对，用
+      选中格的**实心琥珀描边**定位条带在菜单中的位置，再按 x 坐标
+      映射到具体 provider（几何来自本函数返回的 geometry）。
+
+    返回 (png_bytes, geometry)；geometry: list of (x0, x1, key)。
+    """
+    n = len(MODELS)
+    heights = [active if m['key'] == _sel_hint[0] else inactive for m in MODELS]
+    row_h = max(heights)
+    total_w = sum(heights) + gap * (n - 1) + pad * 2
+    total_h = row_h + pad * 2
+    pixels = bytearray(total_w * total_h * 4)
+
+    x = pad
+    geometry = []
+    for m, side in zip(MODELS, heights):
+        buf, w = load_logo(m['logo'], side)
+        y0 = pad + (row_h - side) // 2
+        if buf:
+            for yy in range(side):
+                for xx in range(side):
+                    blit(pixels, total_w, x + xx, y0 + yy, buf, w,
+                         src_x=xx, src_y=yy)
+        else:
+            c = m['color']
+            for yy in range(side):
+                for xx in range(side):
+                    i = ((y0 + yy) * total_w + (x + xx)) * 4
+                    pixels[i:i + 4] = bytes((c[0], c[1], c[2], 255))
+        if m['key'] == _sel_hint[0]:
+            # 选中格：实心琥珀描边（整圈 2px 粗边，连四角）。
+            # 必须实心闭合：截图像素定位靠「一条完整闭合的琥珀色矩形边」
+            # 匹配条带位置；虚线/断角会让闭合性检测失效。
+            hl = (0xd4, 0xa8, 0x6a)
+            bw = 2
+            for yy in range(side):
+                for xx in range(side):
+                    edge = (xx < bw or xx >= side - bw
+                            or yy < bw or yy >= side - bw)
+                    if edge:
+                        i = ((y0 + yy) * total_w + (x + xx)) * 4
+                        pixels[i:i + 4] = bytes((hl[0], hl[1], hl[2], 255))
+        geometry.append((x - pad, x - pad + side, m['key']))
+        x += side + gap
+    return png_bytes(total_w, total_h, bytes(pixels)), geometry
+
+
+# draw_logo_strip 需要「当前选中」做描边，用模块级提示变量传入（避免改签名）
+_sel_hint = ['bigmodel']
+# 条带几何（draw_logo_strip 返回的 [(x0,x1,key),...]），给点击探测器用
+_strip_geom = [None]
+# 条带在屏幕上的标定位置 (strip_left, strip_top)，菜单一打开就自动校准
+_strip_pos = [None]
+# 点击探测状态：上次见到的 leftMouseUp 时间戳（秒）；None=尚未基线化
+_last_up_ts = [None]
+
+
+def _probe_init():
+    """初始化 CoreGraphics ctypes 绑定。失败返回 False（禁用点击探测）。"""
+    if _probe_init._done:
+        return _probe_init._ok
+    _probe_init._done = True
+    try:
+        cg = _probe_init.cg = ctypes.CDLL(
+            '/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
+        cf = _probe_init.cf = ctypes.CDLL(
+            '/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+
+        class CGPoint(ctypes.Structure):
+            _fields_ = [('x', ctypes.c_double), ('y', ctypes.c_double)]
+        _probe_init.CGPoint = CGPoint
+
+        for fn, args, res in (
+            ('CGEventCreate', [ctypes.c_void_p], ctypes.c_void_p),
+            ('CGEventGetLocation', [ctypes.c_void_p], CGPoint),
+            ('CGEventSourceSecondsSinceLastEventType',
+             [ctypes.c_uint32, ctypes.c_uint32], ctypes.c_double),
+            ('CGWindowListCopyWindowInfo',
+             [ctypes.c_uint32, ctypes.c_uint32], ctypes.c_void_p),
+        ):
+            f = getattr(cg, fn)
+            f.argtypes = args
+            f.restype = res
+        for fn, args, res in (
+            ('CFArrayGetCount', [ctypes.c_void_p], ctypes.c_long),
+            ('CFArrayGetValueAtIndex',
+             [ctypes.c_void_p, ctypes.c_long], ctypes.c_void_p),
+            ('CFDictionaryGetValue',
+             [ctypes.c_void_p, ctypes.c_void_p], ctypes.c_void_p),
+            ('CFStringCreateWithCString',
+             [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_void_p),
+            ('CFNumberGetValue',
+             [ctypes.c_void_p, ctypes.c_long, ctypes.c_void_p], ctypes.c_bool),
+        ):
+            f = getattr(cf, fn)
+            f.argtypes = args
+            f.restype = res
+        cf.CFStringGetCString.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+        cf.CFStringGetCString.restype = ctypes.c_bool
+        _probe_init._ok = True
+    except Exception:
+        _probe_init._ok = False
+    return _probe_init._ok
+
+
+_probe_init._done = False
+_probe_init._ok = False
+
+
+def _key(s):
+    cf = _probe_init.cf
+    return cf.CFStringCreateWithCString(None, s.encode(), 0x08000100)
+
+
+def _cstr(ref):
+    if not ref:
+        return ''
+    cf = _probe_init.cf
+    buf = ctypes.create_string_buffer(256)
+    return (buf.value.decode()
+            if cf.CFStringGetCString(ref, buf, 256, 0x08000100) else '')
+
+
+def _cnum(ref):
+    if not ref:
+        return None
+    cf = _probe_init.cf
+    out = ctypes.c_double(0)
+    cf.CFNumberGetValue(ref, 6, ctypes.byref(out))  # kCFNumberFloat64Type
+    return out.value
+
+
+def find_menu_windows():
+    """枚举 on-screen 窗口，返回 SwiftBar 菜单弹出窗口列表 [(id,x,y,w,h)]。
+
+    SwiftBar 的 NSMenu 弹出层是 layer=101（kCGPopUpMenuWindowLevel）。
+    """
+    if not _probe_init():
+        return []
+    cg, cf = _probe_init.cg, _probe_init.cf
+    try:
+        arr = cg.CGWindowListCopyWindowInfo(1 | 16, 0)  # onScreen|excludeDesktop
+        if not arr:
+            return []
+        out = []
+        for i in range(cf.CFArrayGetCount(arr)):
+            d = cf.CFArrayGetValueAtIndex(arr, i)
+            if _cstr(cf.CFDictionaryGetValue(d, _key('kCGWindowOwnerName'))) != 'SwiftBar':
+                continue
+            if _cnum(cf.CFDictionaryGetValue(d, _key('kCGWindowLayer'))) != 101:
+                continue
+            b = cf.CFDictionaryGetValue(d, _key('kCGWindowBounds'))
+            if not b:
+                continue
+            x = _cnum(cf.CFDictionaryGetValue(b, _key('X')))
+            y = _cnum(cf.CFDictionaryGetValue(b, _key('Y')))
+            w = _cnum(cf.CFDictionaryGetValue(b, _key('Width')))
+            h = _cnum(cf.CFDictionaryGetValue(b, _key('Height')))
+            num = _cnum(cf.CFDictionaryGetValue(d, _key('kCGWindowNumber')))
+            if None not in (x, y, w, h, num):
+                out.append((int(num), x, y, w, h))
+        return out
+    except Exception:
+        return []
+
+
+def mouse_state():
+    """返回 (mx, my, up_elapsed)。up_elapsed = 距上次真实 leftMouseUp 的秒数。
+
+    只统计真实硬件事件（合成事件不计入）—— 免辅助功能权限。
+    """
+    if not _probe_init():
+        return (None, None, None)
+    cg = _probe_init.cg
+    try:
+        ev = cg.CGEventCreate(None)
+        loc = cg.CGEventGetLocation(ev)
+        up = cg.CGEventSourceSecondsSinceLastEventType(1, 2)  # 1=hid, 2=leftMouseUp
+        return (loc.x, loc.y, up)
+    except Exception:
+        return (None, None, None)
+
+
+_AMBER = (0xd4, 0xa8, 0x6a)
+
+
+def _read_png_rgb(path):
+    """纯 Python 解码 8bit 非隔行 PNG，返回 (w, h, ch, rgb_bytes)。"""
+    import struct
+    import zlib
+    d = open(path, 'rb').read()
+    if d[:8] != b'\x89PNG\r\n\x1a\n':
+        raise ValueError('not png')
+    pos, idat, meta = 8, b'', {}
+    while pos < len(d):
+        ln = struct.unpack('>I', d[pos:pos + 4])[0]
+        typ = d[pos + 4:pos + 8]
+        data = d[pos + 8:pos + 8 + ln]
+        if typ == b'IHDR':
+            w, h, depth, ctype, _c, _f, inter = struct.unpack('>IIBBBBB', data)
+            meta = (w, h, depth, ctype, inter)
+        elif typ == b'IDAT':
+            idat += data
+        elif typ == b'IEND':
+            break
+        pos += 12 + ln
+    w, h, depth, ctype, inter = meta
+    if depth != 8 or inter != 0 or ctype not in (2, 6):
+        raise ValueError('unsupported png %r' % (meta,))
+    ch = 3 if ctype == 2 else 4
+    raw = zlib.decompress(idat)
+    stride = w * ch
+    out = bytearray(w * h * ch)
+    prev = bytearray(stride)
+    pos = 0
+    for y in range(h):
+        f = raw[pos]
+        pos += 1
+        line = bytearray(raw[pos:pos + stride])
+        pos += stride
+        if f == 1:
+            for i in range(ch, stride):
+                line[i] = (line[i] + line[i - ch]) & 0xff
+        elif f == 2:
+            for i in range(stride):
+                line[i] = (line[i] + prev[i]) & 0xff
+        elif f == 3:
+            for i in range(stride):
+                a = line[i - ch] if i >= ch else 0
+                line[i] = (line[i] + ((a + prev[i]) >> 1)) & 0xff
+        elif f == 4:
+            for i in range(stride):
+                a = line[i - ch] if i >= ch else 0
+                b = prev[i]
+                c = prev[i - ch] if i >= ch else 0
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                line[i] = (line[i] + pr) & 0xff
+        out[y * stride:(y + 1) * stride] = line
+        prev = line
+    if ch == 4:
+        rgb = bytearray(w * h * 3)
+        for i in range(w * h):
+            rgb[i * 3:i * 3 + 3] = out[i * 4:i * 4 + 3]
+        return w, h, 3, bytes(rgb)
+    return w, h, 3, bytes(out)
+
+
+def locate_strip_on_screen(timeout=3.0):
+    """在打开的 SwiftBar 菜单里找条带：全屏截图 + 搜实心琥珀描边矩形。
+
+    返回条带图左上角的屏幕坐标 (sx, sy)，找不到返回 None。
+    选中格描边是 12~15px 见方、2px 粗的琥珀实心边框 —— 全屏里几乎唯一。
+    """
+    import subprocess
+    cap = '/tmp/llm_bar_cap.png'   # screencapture 拒绝写点前缀隐藏文件名
+    try:
+        t0 = time.time()
+        subprocess.run(['screencapture', '-x', cap],
+                       check=True, timeout=timeout)
+        w, h, ch, px = _read_png_rgb(cap)
+    except Exception:
+        return None
+    # 扫描：琥珀色像素的行/列直方图 → 找 12~16px 见方的实心边框。
+    # 等价于找「连续 run 长度 12~16 且上边+下边平行」的行段。
+    amber_rows = {}   # y -> [x0, x1]（该行琥珀像素的最左/最右）
+    amber_rows_n = {}
+    for y in range(0, h, 1):
+        xs = None
+        # 逐行找琥珀 run：允许 ±8 色差（截图有色彩管理偏移）
+        x = 0
+        while x < w:
+            i = (y * w + x) * 3
+            if (abs(px[i] - _AMBER[0]) <= 10 and abs(px[i + 1] - _AMBER[1]) <= 10
+                    and abs(px[i + 2] - _AMBER[2]) <= 10):
+                j = x
+                while j < w:
+                    k = (y * w + j) * 3
+                    if not (abs(px[k] - _AMBER[0]) <= 10
+                            and abs(px[k + 1] - _AMBER[1]) <= 10
+                            and abs(px[k + 2] - _AMBER[2]) <= 10):
+                        break
+                    j += 1
+                run = j - x
+                if 11 <= run <= 17:   # 选中格边长 12/15（±1px 渲染误差）
+                    if xs is None:
+                        xs = []
+                    xs.append((x, j - 1))
+                x = j
+            else:
+                x += 1
+        if xs:
+            amber_rows[y] = xs
+            amber_rows_n[y] = len(xs)
+    # 找「上边（整行连续 run）+ 下边（同 x 范围）」配对，间距 10~14
+    ys = sorted(amber_rows.keys())
+    for i, y1 in enumerate(ys):
+        for (a1, b1) in amber_rows[y1]:
+            if b1 - a1 < 11:
+                continue
+            for y2 in ys[i + 1:]:
+                if not (10 <= y2 - y1 <= 14):
+                    if y2 - y1 > 14:
+                        break
+                    continue
+                for (a2, b2) in amber_rows[y2]:
+                    if abs(a2 - a1) <= 2 and abs(b2 - b1) <= 2:
+                        # 竖边在逐行扫描里已包含（每行都有 xs），
+                        # 统计 y1..y2 之间行数占比 >= 60% 即闭合边框
+                        rows_between = [y for y in ys
+                                        if y1 < y < y2
+                                        and any(abs(a - a1) <= 2
+                                                for (a, _b) in amber_rows[y])]
+                        if len(rows_between) >= (y2 - y1 - 1) * 0.6:
+                            return (a1, y1)
+                        break
+                else:
+                    continue
+                break
+        if time.time() - t0 > timeout:
+            break
+    return None
+
+
+def handle_menu_click(prev_sel):
+    """点击探测主入口。返回应切换到的 provider key，无切换返回 None。
+
+    判定链：
+      1. 出现「新的」真实 leftMouseUp（时间戳比上次记录的新）
+      2. 此刻鼠标坐标落在某个 layer=101 SwiftBar 菜单窗口内
+      3. 定位条带左缘：
+         a. 首选截图：在截图中找实心琥珀描边（精确，但依赖屏幕录制授权）
+         b. fallback 几何推算：条带左缘 = 菜单窗口 x + MENU_IMG_INSET
+      4. 鼠标 x 相对条带左缘的偏移命中 geometry 的哪个格子
+      5. 该格子不是当前选中 → 返回目标 key
+
+    每次新点击都会写一条 CLICK_LOG 标定日志（点击坐标/窗口/定位结果/
+    命中格子），真实环境跑一次即可核对 fallback 常数是否需要修正。
+    """
+    mx, my, up = mouse_state()
+    if mx is None:
+        return None
+    if _last_up_ts[0] is None:
+        _last_up_ts[0] = up          # 首轮基线化，不触发
+        return None
+    if up >= _last_up_ts[0] - 1e-9:
+        _last_up_ts[0] = up
+        return None
+    # 出现了新的 leftMouseUp（up 变小 = 计时器刚被重置）
+    _last_up_ts[0] = up
+    if up > 1.2:
+        return None                  # 太久前的点击，与本次轮询无关
+    # 鼠标必须在某个 SwiftBar 菜单窗口内
+    wins = find_menu_windows()
+    win = next(((wx, wy, ww, wh) for (_n, wx, wy, ww, wh) in wins
+                if wx <= mx < wx + ww and wy <= my < wy + wh), None)
+    if win is None:
+        return None
+    geom = _strip_geom[0]
+    if not geom:
+        return None
+
+    # ---- 定位条带左缘（标定缓存 > 截图 > 几何 fallback）----
+    cached = _strip_pos[0]
+    if cached is not None:
+        strip_left, strip_top = cached
+        method = 'calibrated'
+    else:
+        pos = locate_strip_on_screen()
+        if pos is not None:
+            sx, sy = pos
+            sel_i = next((i for i, (x0, x1, k) in enumerate(geom)
+                          if k == prev_sel), 0)
+            strip_left = sx - geom[sel_i][0]     # 描边左缘反推条带左缘
+            strip_top = sy
+            method = 'screenshot'
+        else:
+            wx, wy, ww, wh = win
+            strip_left = wx + MENU_IMG_INSET
+            strip_top = wy + MENU_BODY_TOP
+            method = 'geometry'
+
+    # Y 约束：鼠标必须落在条带行内（否则点到菜单其它行会被误判为切换）
+    if not (strip_top - STRIP_Y_TOLERANCE <= my
+            <= strip_top + STRIP_H + STRIP_Y_TOLERANCE):
+        _log_click({'mx': mx, 'my': my, 'method': method,
+                    'strip_left': strip_left, 'strip_top': strip_top,
+                    'rel_x': mx - strip_left, 'hit': None, 'prev': prev_sel,
+                    'reason': 'y_out_of_strip_row',
+                    'wins': [(int(x), int(y), int(w), int(h))
+                             for (_n, x, y, w, h) in wins]})
+        return None
+
+    rel_x = mx - strip_left
+    hit = None
+    for (x0, x1, key) in geom:
+        if x0 <= rel_x < x1 + 2:         # +2: 选中格 2px 描边的外扩
+            hit = key
+            break
+    _log_click({'mx': mx, 'my': my, 'method': method, 'strip_left': strip_left,
+                'strip_top': strip_top, 'rel_x': rel_x, 'hit': hit,
+                'prev': prev_sel,
+                'wins': [(int(x), int(y), int(w), int(h))
+                         for (_n, x, y, w, h) in wins]})
+    if hit and hit != prev_sel:
+        return hit
+    return None
+
+
+def calibrate_strip():
+    """菜单打开时自动标定条带位置，缓存到 _strip_pos。
+
+    插件进程是 SwiftBar 子进程，继承 SwiftBar 的屏幕录制权限，
+    因此 screencapture 在插件内可用（沙箱 shell 里不可用）。
+    返回 (strip_left, strip_top) 或 None。
+    """
+    wins = find_menu_windows()
+    if not wins:
+        return None
+    geom = _strip_geom[0]
+    if not geom:
+        return None
+    pos = locate_strip_on_screen()
+    if pos is None:
+        return None
+    sx, sy = pos
+    sel_key = _sel_hint[0]
+    sel_i = next((i for i, (x0, x1, k) in enumerate(geom)
+                  if k == sel_key), 0)
+    strip_left = sx - geom[sel_i][0]
+    _strip_pos[0] = (strip_left, sy)
+    _log_click({'calibration': True, 'strip_left': strip_left, 'strip_top': sy,
+                'method': 'screenshot',
+                'wins': [(int(x), int(y), int(w), int(h))
+                         for (_n, x, y, w, h) in wins]})
+    return _strip_pos[0]
+
+
+def _log_click(info):
+    """点击标定日志：真实环境核对 fallback 常数用。"""
+    try:
+        os.makedirs(DATA, exist_ok=True)
+        with open(CLICK_LOG, 'a') as f:
+            f.write(json.dumps({'at': datetime.now().isoformat(),
+                                'pid': os.getpid(), **info},
+                               ensure_ascii=False) + '\n')
+    except Exception:
+        pass
+
+
 def draw_single_logo(size=28, model=None, selected=False):
     """下拉菜单里单个 provider 的 logo（带选中描边）。"""
     model = model or MODELS[0]
@@ -201,65 +675,74 @@ def draw_status_icon(logo_size=20, pct=None, model=None, scale=1.0,
                      bar_progress=None, prev_model=None, prev_alpha=0.0):
     """状态栏图标：provider logo + 底部迷你进度条。
 
+    输出固定为 **正方形** logo_size × logo_size（SwiftBar 菜单栏状态项
+    按正方形图标渲染，非等比 PNG 会被缩放变形，且可能被判定为无效
+    状态项 → 菜单栏不显示）。进度条做成底部 3px 横条，占用 logo 高度内的
+    底部区域，因此整体仍是正方形。
+
     scale:      logo 缩放比例（做弹入动效）
     bar_progress: 进度条填充比例 0..1（覆盖 pct，做填充动效）
     prev_model / prev_alpha: 交叉淡入时的上一个 logo
     """
     model = model or MODELS[0]
-    bar_h = 4
-    box = int(round(logo_size * scale))
-    total_w = max(logo_size, box)
-    total_h = total_w + 2 + bar_h
-    pixels = bytearray(total_w * total_h * 4)
+    total = logo_size
+    bar_h = 3
+    pixels = bytearray(total * total * 4)
 
-    # 底部进度条
+    # 底部进度条（画在正方形内部底部）
     if bar_progress is None:
         bar_progress = 0 if pct is None else max(0, min(100, pct)) / 100.0
-    fill_w = round(total_w * bar_progress)
+    fill_w = round(total * bar_progress)
     fill = health_color((bar_progress * 100) if pct is None else pct, model['color'])
     bg = (0xd8, 0xd3, 0xca)
-    by0 = total_w + 2
+    by0 = total - bar_h
     for y in range(bar_h):
-        for x in range(total_w):
-            i = ((y + by0) * total_w + x) * 4
+        for x in range(total):
+            i = ((y + by0) * total + x) * 4
             if x < fill_w:
                 pixels[i:i + 4] = bytes((fill[0], fill[1], fill[2], 255))
             else:
                 pixels[i:i + 4] = bytes((bg[0], bg[1], bg[2], 255))
 
+    # logo 可用高度 = 总高 - 进度条高度
+    logo_area = total - bar_h
+    box = int(round(logo_area * scale))
+    if box > logo_area:
+        box = logo_area
+
     # 旧 logo（淡出）
     if prev_model and prev_alpha > 0:
-        buf, w = load_logo(prev_model['logo'], logo_size)
+        buf, w = load_logo(prev_model['logo'], logo_area)
         if buf:
-            for y in range(logo_size):
-                for x in range(logo_size):
-                    blit(pixels, total_w, x, y, buf, w,
+            for y in range(logo_area):
+                for x in range(logo_area):
+                    blit(pixels, total, x, y, buf, w,
                          src_x=x, src_y=y, alpha=prev_alpha)
         else:
             c = prev_model['color']
-            for y in range(logo_size):
-                for x in range(logo_size):
-                    i = (y * total_w + x) * 4
+            for y in range(logo_area):
+                for x in range(logo_area):
+                    i = (y * total + x) * 4
                     pixels[i:i + 4] = bytes((c[0], c[1], c[2], 255))
 
-    # 新 logo（缩放弹入）
+    # 新 logo（缩放弹入），在 logo 区域内居中
     if box >= 1:
         buf, w = load_logo(model['logo'], box)
-        ox = (total_w - box) // 2
-        oy = (total_w - box) // 2
+        ox = (total - box) // 2
+        oy = (logo_area - box) // 2
         if buf:
             for y in range(box):
                 for x in range(box):
-                    blit(pixels, total_w, ox + x, oy + y, buf, w,
+                    blit(pixels, total, ox + x, oy + y, buf, w,
                          src_x=x, src_y=y)
         else:
             c = model['color']
             for y in range(box):
                 for x in range(box):
-                    i = ((oy + y) * total_w + ox + x) * 4
+                    i = ((oy + y) * total + ox + x) * 4
                     pixels[i:i + 4] = bytes((c[0], c[1], c[2], 255))
 
-    return png_bytes(total_w, total_h, bytes(pixels))
+    return png_bytes(total, total, bytes(pixels))
 
 
 # ===================== 动效 =====================
@@ -340,7 +823,48 @@ def write_last_rendered(model):
         pass
 
 
-SNAPSHOT_MAX_AGE = 600      # 快照超过 10 分钟才重新采集
+# 帧计数落盘（可观测性）：用于排查「菜单栏闪烁」这类问题 ——
+#   直接读这个文件就知道插件实际向 SwiftBar 提交了多少帧、最后一帧何时提交。
+#   空闲期（内容不变）不应再提交帧，若 frames 持续快速增长即为刷屏。
+FRAME_STAT = os.path.join(DATA, '.frame_stat.json')
+
+
+def write_frame_stat(frames, last_at, sel):
+    try:
+        os.makedirs(DATA, exist_ok=True)
+        tmp = FRAME_STAT + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump({
+                'frames': frames,
+                'last_frame_at': last_at,
+                'model': sel,
+                'pid': os.getpid(),
+            }, f)
+        os.replace(tmp, FRAME_STAT)
+    except Exception:
+        pass
+
+
+# stdin 回传日志（可观测性）：验证 SwiftBar 点击是否真的把文本回传到常驻进程。
+#   macOS 上菜单栏是独立合成层，screencapture 抓不到，
+#   所以实机验证「点击是否生效」只能靠这个日志。
+STDIN_LOG = os.path.join(DATA, '.stdin_log.jsonl')
+
+
+def log_stdin(cmd):
+    try:
+        os.makedirs(DATA, exist_ok=True)
+        with open(STDIN_LOG, 'a') as f:
+            f.write(json.dumps({
+                'at': datetime.now().isoformat(),
+                'cmd': cmd,
+                'pid': os.getpid(),
+            }, ensure_ascii=False) + '\n')
+    except Exception:
+        pass
+
+
+SNAPSHOT_MAX_AGE = 60       # 快照超过 60 秒才重新采集（用户要求每分钟取一次）
 
 
 def fetch_data(force=False):
@@ -441,15 +965,27 @@ def render_dropdown(data, errors, sel):
     data_rows = data.get('rows', [])
     out = []
     out.append('---')
-    # 顶部：各 provider 的 logo（可点击切换）
-    for m in MODELS:
-        lp = draw_single_logo(28, m, m['key'] == sel)
-        out.append(' | image=' + b64(lp)
-                   + ' bash=' + SWITCH
-                   + ' params param0=' + m['key']
-                   + ' terminal=false refresh=true'
-                   + ' tooltip=' + m['name'])
-    out.append('当前：' + model['name'] + ' · 点上方 logo 切换 | size=11 color=#8a8680')
+
+    # 顶部：横向 logo 条带（5 个 provider 拼一张图，选中者实心琥珀描边）。
+    #   2026-11-11 v2 改造：**去掉 fold 下拉**，条带本身直接承载点击切换。
+    #   实现：条带是**无 action 的纯图片项**——
+    #   - 实测（/tmp/testmenu/gray 离屏渲染）：disabled 项的 image 不被
+    #     灰化，保持原始饱和色（RGB 230,38,38 == 源色）；
+    #   - SwiftBar buildMenuItem：无 action 且无 color 的项 item.action=nil
+    #     → 点击不触发 performItemAction → 菜单不会 dismiss；
+    #   - 点击探测由常驻进程自己做（见主循环 CLICK_DETECT 段）：
+    #     CGEventSource 检测真实 leftMouseUp（免辅助功能权限、合成事件
+    #     不计入）→ 枚举 layer=101 SwiftBar 菜单窗口 → screencapture
+    #     全屏截图像素比对实心琥珀描边定位条带 → 鼠标 x 相对条带左缘的
+    #     偏移命中 geometry 里的哪个 provider → 进程内直接切换+动效。
+    #   - 点击落在菜单内但条带外 / 点在菜单外：静默忽略。
+    _sel_hint[0] = sel
+    strip_png, strip_geom = draw_logo_strip()
+    # 条带几何存给点击探测器（x0/x1 相对条带图左缘）
+    _strip_geom[0] = strip_geom
+    out.append(' | image=' + b64(strip_png)
+               + ' tooltip=点击 logo 切换 provider（无需展开列表）')
+    out.append('当前：' + model['name'] + ' | size=11 color=#8a8680')
 
     # 主体：当前 provider 的额度
     out.append('---')
@@ -526,7 +1062,10 @@ def render_dropdown(data, errors, sel):
 
     # 底部操作区（与 v1 一致）
     out.append('---')
-    out.append('刷新 | refresh=true')
+    # 刷新走 stdin= 协议（由常驻进程自己重新采集）：
+    #   refresh=true 会让 SwiftBar 重跑插件脚本 → 重启 streamable 进程
+    #   → 进程一死菜单栏短暂空白、重新取数要等十几秒。
+    out.append('刷新 | stdin=refresh tooltip=重新采集所有 provider 用量')
     out.append('打开仪表盘 | bash=' + ROOT + '/scripts/open_dashboard.sh terminal=false')
     out.append('重新登录（浏览器）| bash=' + ROOT + '/scripts/login.sh terminal=true')
     out.append('从 Chrome 同步登录态 | bash=' + ROOT + '/scripts/sync_chrome_auth.sh terminal=true')
@@ -554,53 +1093,177 @@ def main():
 
     last_data_refresh = time.time()
     idle_tick = 0
+    last_frame = None          # 上一次输出的完整帧内容（去重用）
+    stdin_buf = ''             # SwiftBar stdin= 协议：点击回传的命令缓冲
+    frame_count = 0            # 已提交帧计数（写 .frame_stat.json 供观测）
+
+    def handle_stdin_cmd(cmd):
+        """处理一条 stdin 命令。用 nonlocal 改写主循环的状态变量。"""
+        nonlocal prev_sel, prev_model, anim_t, data, errors
+        global data_rows
+        if not cmd:
+            return
+        log_stdin(cmd)
+        if cmd.startswith('switch:'):
+            target = cmd[len('switch:'):].strip()
+            if target in MODEL_BY_KEY and target != prev_sel:
+                write_selected(target)
+                prev_model = MODEL_BY_KEY[prev_sel]
+                prev_sel = target
+                anim_t = 0.0
+        elif cmd == 'refresh':
+            # 手动刷新：立即重新采集（不重启 streamable 进程，
+            # 否则进程一死菜单栏会短暂变空白 / ! ）。
+            try:
+                data = fetch_data(force=True)
+                data_rows = data.get('rows', [])
+                errors = data.get('errors', {})
+            except Exception:
+                pass
 
     while True:
-        # ---- 检测 provider 变化（点击 logo → switch_model.sh 改状态文件）----
-        cur = read_selected()
-        if cur != prev_sel:
-            prev_model = MODEL_BY_KEY[prev_sel]
-            prev_sel = cur
-            anim_t = 0.0
+        try:
+            # ---- stdin= 协议：读 SwiftBar 点击回传（不重启进程、不收菜单重绘）----
+            # SwiftBar 对 streamable 插件点击带 stdin= 的菜单项时，
+            # 会把 stdin= 的文本写到插件进程的 stdin 管道（stdinPipe）。
+            # 源码 StreamablePlugin.writeStdin 写的是「原文 + \n」，
+            # 这里按行解析，同时兼容不带换行的写入。
+            # 用 os.read 而非 sys.stdin.read(1)：后者在 TTY 模式下行缓冲，
+            # 管道模式下逐字节读；os.read 在两种场景下都立即可用。
+            try:
+                while True:
+                    chunk = select_mod.select([sys.stdin], [], [], 0)[0]
+                    if not chunk:
+                        break
+                    piece = os.read(sys.stdin.fileno(), 256)
+                    if not piece:
+                        break
+                    stdin_buf += piece.decode('utf-8', errors='replace')
+                    if len(stdin_buf) > 512:      # 防御：缓冲异常增长
+                        stdin_buf = stdin_buf[-128:]
+            except (OSError, ValueError, TypeError):
+                pass
 
-        model = MODEL_BY_KEY[prev_sel]
-        pct = main_pct(data_rows, prev_sel)
-        scale, bar, prev_alpha = anim_state(anim_t)
+            # 处理缓冲区里的所有完整命令行
+            while '\n' in stdin_buf:
+                line, stdin_buf = stdin_buf.split('\n', 1)
+                handle_stdin_cmd(line.strip())
+            # 没有换行结尾时也尝试按已知命令直接匹配（兼容不带换行的写入）
+            tail = stdin_buf.strip()
+            if tail and (tail == 'refresh' or
+                         (tail.startswith('switch:') and
+                          tail[len('switch:'):] in MODEL_BY_KEY)):
+                handle_stdin_cmd(tail)
+                stdin_buf = ''
 
-        icon = draw_status_icon(20, pct, model, scale=scale,
-                                bar_progress=(bar if anim_t < 1.0 else None),
-                                prev_model=prev_model, prev_alpha=prev_alpha)
-        header = header_text(data_rows, prev_sel, errors)
+            # ---- 条带点击探测（CLICK_DETECT）----
+            # 条带是无 action 的图片项（点击不触发任何 SwiftBar 动作、
+            # 菜单不 dismiss），由本进程自己识别「用户点了哪个 logo」：
+            #   新的真实 leftMouseUp + 鼠标在 SwiftBar 菜单窗口内
+            #   → 截图定位实心琥珀描边（条带）→ 按 x 命中 geometry 格子。
+            # 开销控制：空闲期每 0.5s 一次 mouse_state（纯 ctypes 读，~0ms），
+            # 只在「新的点击 + 在菜单内」时才付出一次 screencapture（~80ms）。
+            # 菜单还开着时 SwiftBar 走 incrementalUpdateMenu 原地刷新，
+            # 菜单不会收起，动效连续。
+            try:
+                # 菜单一出现就自动标定条带位置（截图一次，之后复用）
+                if _strip_pos[0] is None and find_menu_windows():
+                    calibrate_strip()
+                hit = handle_menu_click(prev_sel)
+            except Exception:
+                hit = None
+            if hit:
+                write_selected(hit)
+                prev_model = MODEL_BY_KEY[prev_sel]
+                prev_sel = hit
+                anim_t = 0.0
 
-        lines = [' | image=' + b64(icon),
-                 header + ' | size=12 color=' + hexc(model['color'])]
-        lines.extend(render_dropdown(data, errors, prev_sel))
+            # ---- 检测 provider 变化（点击 logo → switch_model.sh 改状态文件）----
+            cur = read_selected()
+            if cur != prev_sel:
+                prev_model = MODEL_BY_KEY[prev_sel]
+                prev_sel = cur
+                anim_t = 0.0
 
-        print('\n'.join(lines))
-        sys.stdout.flush()
-        print('~~~')
-        sys.stdout.flush()
+            model = MODEL_BY_KEY[prev_sel]
+            pct = main_pct(data_rows, prev_sel)
+            scale, bar, prev_alpha = anim_state(anim_t)
 
-        if anim_t < 1.0:
-            # 动画帧：快速推进
-            anim_t = min(1.0, anim_t + ANIM_STEP)
+            icon = draw_status_icon(20, pct, model, scale=scale,
+                                    bar_progress=(bar if anim_t < 1.0 else None),
+                                    prev_model=prev_model, prev_alpha=prev_alpha)
+            header = header_text(data_rows, prev_sel, errors)
+
+            # header 首行：logo 图与文字必须同行，且必须带文字。
+            #   SwiftBar 对「header 只有图片、没有文字」的渲染不稳：
+            #   纯 image 行会被判成空内容 → content state: empty →
+            #   状态项 menu item requested visible: no → 菜单栏根本不显示。
+            #   （v1 当天也因此移除了 header image，见提交 c1fe950。）
+            # 注意：不要在这里多加 '---'，render_dropdown 开头自带一个，
+            #   连续分隔符会造出空分组，SwiftBar 同样视为异常。
+            lines = [header + ' | size=12 color=' + hexc(model['color'])
+                     + ' image=' + b64(icon)]
+            lines.extend(render_dropdown(data, errors, prev_sel))
+
+            # ---- streamable 帧协议：`~~~` 必须写在内容「之前」----
+            # SwiftBar 的 `~~~` 是「清空」标记，不是「提交」标记。
+            # 官方 README：「SwiftBar will show 'Test 1' ... then nothing for 5
+            # seconds, and then 'Test 2' indefinitely」——`~~~` 之后的静默期
+            # 菜单栏是空的，之后到达的内容才是当前帧。
+            #
+            # 若把 `~~~` 写在内容之后（本插件初版就是如此），SwiftBar 会在每轮
+            # 末尾清空菜单栏，而下一帧要等 0.5s 才补上 —— 采样正好落在空窗期，
+            # 结果：content state: empty → menu item requested visible: no
+            # → 状态栏什么都不显示（用户看到的是「插件没展示」）。
+            #
+            # 正确顺序：先 `~~~` 清空 → 再吐本帧内容 → 内容常驻到下一轮。
+            #
+            # ---- 帧去重（闪烁修复 2026-11-10）----
+            # SwiftBar 每收到 `~~~` 就重绘菜单栏。空闲期内容完全不变时
+            # 也每 0.5s 重绘一次 11840 字符的大帧 → 菜单栏肉眼可见地闪。
+            # 只有「动画进行中」或「帧内容有变化」才输出。
+            frame = '\n'.join(lines)
+            if anim_t < 1.0 or frame != last_frame:
+                print('~~~')
+                sys.stdout.flush()
+                print(frame)
+                sys.stdout.flush()
+                last_frame = frame
+                frame_count += 1
+                write_frame_stat(frame_count, datetime.now().isoformat(), prev_sel)
+
+            if anim_t < 1.0:
+                # 动画帧：快速推进
+                anim_t = min(1.0, anim_t + ANIM_STEP)
+                write_last_rendered(prev_sel)
+                time.sleep(ANIM_INTERVAL)
+                continue
+
+            # 动画结束，落下最后状态
+            prev_model = None
             write_last_rendered(prev_sel)
-            time.sleep(ANIM_INTERVAL)
-            continue
 
-        # 动画结束，落下最后状态
-        prev_model = None
-        write_last_rendered(prev_sel)
-
-        # ---- 空闲期：快速轮询选择变化 + 定期刷新数据 ----
-        idle_tick += 1
-        if idle_tick % IDLE_TICKS == 0:
-            # 刷新数据（fetch_data 内部按快照年龄判断是否真采集）
-            data = fetch_data()
-            data_rows = data.get('rows', [])
-            errors = data.get('errors', {})
-            last_data_refresh = time.time()
-        time.sleep(IDLE_POLL_INTERVAL)
+            # ---- 空闲期：快速轮询选择变化 + 定期刷新数据 ----
+            idle_tick += 1
+            if idle_tick % IDLE_TICKS == 0:
+                # 刷新数据（fetch_data 内部按快照年龄判断是否真采集）
+                data = fetch_data()
+                data_rows = data.get('rows', [])
+                errors = data.get('errors', {})
+                last_data_refresh = time.time()
+            time.sleep(IDLE_POLL_INTERVAL)
+        except Exception:
+            # 常驻流插件：任何一帧渲染抛异常都不能让进程死掉，
+            # 否则 SwiftBar 会判定插件失败 → 状态栏变 ⚠️/!。
+            # 这里吐一帧最小安全内容（纯文字 + ~~~）并继续轮询。
+            try:
+                sys.stdout.write(
+                    'LLM 额度 | size=12 color=gray\n---\n'
+                    '渲染异常，稍后自动恢复 | color=red size=11\n~~~\n')
+                sys.stdout.flush()
+            except Exception:
+                pass
+            time.sleep(2)
 
 
 if __name__ == '__main__':
