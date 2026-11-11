@@ -15,3 +15,15 @@ data/minimax-probe-*.json
 data/minimax-auth.json
 data/chrome_auth.json
 data/.dead_auth.json
+__pycache__/
+*.pyc
+data/.click_log.jsonl
+data/.fetch.lock
+data/.frame_stat.json
+data/.last_rendered.json
+data/.stdin_log.jsonl
+data/selected.json
+data/*.png
+data/deepseek-dom.json
+data/deepseek-rows.json
+.workbuddy/

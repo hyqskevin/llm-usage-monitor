@@ -5,7 +5,7 @@ const fs = require('fs');
 
 const ROOT = path.join(__dirname, '..');
 const OUT = path.join(ROOT, 'data', 'cookies.json');
-const DOMAINS = ['bigmodel.cn', 'kimi.com', 'minimaxi.com'];
+const DOMAINS = ['bigmodel.cn', 'kimi.com', 'minimaxi.com', 'minimax.cn', 'deepseek.com', 'xiaomimimo.com'];
 
 (async () => {
   const context = await chromium.launchPersistentContext(path.join(ROOT, 'browser-profile'), {
