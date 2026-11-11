@@ -44,9 +44,10 @@ MENU_IMG_INSET = 14
 # 注意：条带是菜单的**第一个图项**，其上只有被 NSMenu 折叠掉的连续
 # separator，因此这个偏移与 body 行数 / provider 无关，是常量。
 MENU_BODY_TOP = 8
-STRIP_H = 19
-# Y 容差：条带行高 25（19 + 上下各 3），点击落在行内任意位置都算命中。
-STRIP_Y_TOLERANCE = 6
+STRIP_H = 34
+# Y 容差：条带行高 = 图高 + 6（NSMenu 图项上下各留 3），点击落在行内
+# 任意位置都算命中。
+STRIP_Y_TOLERANCE = 8
 FETCH_PY = os.path.join(ROOT, 'fetch.py')
 PY_BIN = sys.executable
 
@@ -186,7 +187,7 @@ def draw_bar(pct, width, height=16, base=None):
     return png_bytes(width, height, bytes(pixels))
 
 
-def draw_logo_strip(active=15, inactive=12, gap=4, pad=2):
+def draw_logo_strip(active=28, inactive=24, gap=6, pad=3):
     """下拉菜单顶部的横向 logo 条带：5 个 provider logo 拼成**一张图**。
 
     为什么拼一张图：NSMenu 的每一行只能放一个菜单项（一个 image=），

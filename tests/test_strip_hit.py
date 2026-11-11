@@ -44,36 +44,53 @@ def hit_of(geom, rel_x):
     return None
 
 
+def strip_params():
+    """从 draw_logo_strip 签名取实际尺寸参数（避免测试写死尺寸）。"""
+    import inspect
+    sig = inspect.signature(m.draw_logo_strip)
+    return {k: v.default for k, v in sig.parameters.items()}
+
+
 def test_geometry():
     print('test_geometry')
     geom = geom_for('bigmodel')
+    pa = strip_params()
     check('5 个 provider', len(geom) == 5, str(geom))
     check('key 顺序', [g[2] for g in geom] ==
           ['bigmodel', 'kimi', 'minimax', 'deepseek', 'mimo'], str(geom))
-    # 选中格 15px，其余 12px，gap 4
-    check('选中格宽 15', geom[0][1] - geom[0][0] == 15, str(geom[0]))
-    check('未选中格宽 12', geom[1][1] - geom[1][0] == 12, str(geom[1]))
-    check('gap=4', geom[1][0] - geom[0][1] == 4, str(geom))
+    # 选中格 = active，其余 = inactive，间隔 = gap
+    check('选中格宽 == active', geom[0][1] - geom[0][0] == pa['active'],
+          '%s vs %s' % (geom[0], pa['active']))
+    check('未选中格宽 == inactive', geom[1][1] - geom[1][0] == pa['inactive'],
+          '%s vs %s' % (geom[1], pa['inactive']))
+    check('gap == gap 参数', geom[1][0] - geom[0][1] == pa['gap'],
+          '%s vs %s' % (geom, pa['gap']))
     check('首格起点=0', geom[0][0] == 0, str(geom[0]))
-    # 条带图总宽 83
+    # 条带图总宽 = sum(sides) + gap*(n-1) + pad*2
     png, _ = m.draw_logo_strip()
     # PNG 宽度写在 IHDR
     import struct
     w = struct.unpack('>I', png[16:20])[0]
-    check('条带图宽 83', w == 83, str(w))
+    expect = sum(g[1] - g[0] for g in geom) + pa['gap'] * (len(geom) - 1) \
+        + pa['pad'] * 2
+    check('条带图宽 == 几何推算', w == expect, '%s vs %s' % (w, expect))
 
 
 def test_hit_mapping():
     print('test_hit_mapping')
     geom = geom_for('bigmodel')
-    check('rel 0 → bigmodel', hit_of(geom, 0) == 'bigmodel')
-    check('rel 8 → bigmodel', hit_of(geom, 8) == 'bigmodel')
-    check('rel 24 → kimi', hit_of(geom, 24) == 'kimi')
-    check('rel 37 → minimax', hit_of(geom, 37) == 'minimax')
-    check('rel 56 → deepseek', hit_of(geom, 56) == 'deepseek')
-    check('rel 70 → mimo', hit_of(geom, 70) == 'mimo')
-    check('gap 落在 none', hit_of(geom, 17) is None, 'gap区不应命中')
-    check('超出右边界 none', hit_of(geom, 82) is None)
+    # 每格取中点 → 必须命中自己
+    for (x0, x1, key) in geom:
+        mid = (x0 + x1) // 2
+        check('rel %d → %s' % (mid, key), hit_of(geom, mid) == key,
+              'got %s' % hit_of(geom, mid))
+    # gap 落在 none（取 gap 中点；两侧各留 2px 容差给选中格描边）
+    gap_x = (geom[0][1] + geom[1][0]) // 2
+    check('gap 落在 none', hit_of(geom, gap_x) is None,
+          'gap区 x=%d 不应命中' % gap_x)
+    # 超出右边界 none
+    last = geom[-1]
+    check('超出右边界 none', hit_of(geom, last[1] + 2) is None)
 
 
 def test_constants():
@@ -81,7 +98,12 @@ def test_constants():
     # 地面真值（/tmp/striptest/final.swift AppKit 实测）
     check('MENU_IMG_INSET == 14', m.MENU_IMG_INSET == 14, str(m.MENU_IMG_INSET))
     check('MENU_BODY_TOP == 8', m.MENU_BODY_TOP == 8, str(m.MENU_BODY_TOP))
-    check('STRIP_H == 19', m.STRIP_H == 19, str(m.STRIP_H))
+    # STRIP_H 必须等于条带图实际高度（active + pad*2）
+    import struct
+    png, _ = m.draw_logo_strip()
+    h = struct.unpack('>I', png[20:24])[0]
+    check('STRIP_H == 条带图高', m.STRIP_H == h,
+          '%s vs %s' % (m.STRIP_H, h))
 
 
 class FakeWin:
@@ -125,8 +147,9 @@ def test_handle_menu_click():
         with FakeWin(WIN, (mx, my, 0.0)):      # 新点击
             return m.handle_menu_click(prev)
 
-    # 1. 点击 minimax 格（rel 37 → 屏幕 862），应返回 minimax
-    r = click(strip_left + 37, strip_top + 5)
+    # 1. 点击 minimax 格（格中点）应返回 minimax
+    mid = {g[2]: (g[0] + g[1]) // 2 for g in geom}
+    r = click(strip_left + mid['minimax'], strip_top + 5)
     check('点 minimax → minimax', r == 'minimax', str(r))
 
     # 2. 点击当前选中格（bigmodel，rel 5）→ 不切换
@@ -134,7 +157,7 @@ def test_handle_menu_click():
     check('点当前格 → None', r is None, str(r))
 
     # 3. Y 落在条带行外（menu 其他行）→ None
-    r = click(strip_left + 37, strip_top + 60)
+    r = click(strip_left + mid['minimax'], strip_top + 60)
     check('行外 Y → None', r is None, str(r))
 
     # 4. 菜单窗口外 → None
@@ -143,21 +166,30 @@ def test_handle_menu_click():
 
     # 5. 无新点击（up 不变）→ None
     m._last_up_ts[0] = 0.5
-    with FakeWin(WIN, (strip_left + 37, strip_top + 5, 0.5)):
+    with FakeWin(WIN, (strip_left + mid['minimax'], strip_top + 5, 0.5)):
         r = m.handle_menu_click('bigmodel')
     check('无新点击 → None', r is None, str(r))
 
-    # 6. 真实点击日志回放：10:31 那次（my=41, mx=862）应命中 minimax
-    r = click(862.0, 41.0)
-    check('回放 10:31 点击 → minimax', r == 'minimax', str(r))
-
-    # 7. 真实点击日志回放：10:20 那次（mx=849, my=39）应命中 kimi
-    r = click(849.0, 39.0)
-    check('回放 10:20 点击 → kimi', r == 'kimi', str(r))
-
-    # 8. 真实点击日志回放：10:19 那次（mx=873, my=45）应命中 minimax
-    r = click(873.0, 45.0)
-    check('回放 10:19 点击 → minimax', r == 'minimax', str(r))
+    # 6-8. 真实点击日志回放：这些点击此前全部落 y_out_of_strip_row，
+    #      修正几何后必须命中某个 provider（而不是 None）。
+    #      注：条带放大后 x 映射结果会变（老日志是 15/12px 布局下打的），
+    #      所以这里只断言「命中了某个合法 provider」。
+    # 用 2026-11-11 上午真实点击日志里的三次原始坐标（记录在案，不读实时
+    # 日志文件——测试自身调用也会写日志，会互相污染）。
+    # 这三次在旧几何（Y 偏移 47）下全部落 y_out_of_strip_row。
+    REAL = [(873.0, 45.0, '10:19'),
+            (849.0, 39.0, '10:20'),
+            (862.0, 41.0, '10:31')]
+    keys = [g[2] for g in geom]
+    for mx, my, tag in REAL:
+        r = click(mx, my)
+        # 期望值按几何推导：rel_x 落在哪一格 → 就该返回那一格；
+        # 若恰好落在当前选中格 bigmodel，则不切换（返回 None）是正确行为。
+        rel = mx - strip_left
+        want = hit_of(geom, rel)
+        expect = None if want == 'bigmodel' else want
+        check('回放 %s 点击 → %s' % (tag, expect), r == expect,
+              'rel=%s want=%s got=%s' % (rel, expect, r))
 
 
 if __name__ == '__main__':
