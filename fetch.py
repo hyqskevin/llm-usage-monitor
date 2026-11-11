@@ -87,7 +87,17 @@ def pick_headers(req, keys):
 
 # 各站点「鉴权失效」的判定依据：接口返回 HTTP 200 但 body 里带 code/msg 错误，
 # 或直接 401/403。命中即视为 token 失效，不再重试刷新（刷新对已失效会话无效）。
-AUTH_ERROR_CODES = ('登录状态已过期', 'unauthorized', 'token expired', '登录已失效')
+#
+# 2026-11-11 修：mimo 之前漏判。fetch_mimo 抛的是
+#   RuntimeError(f"mimo auth failed: {resp}")
+# 而 'mimo auth failed' 不在白名单里 → is_auth_error 返回 False →
+# mimo 被当成「网络/解析错误」走 refresh_auth_for 重试分支，而
+# token_fingerprint 对 mimo 恒为 None（mimo 不用 authorization 头，
+# 用的是 session cookie），于是 refresh_auth_for 永远返回 False，
+# 最终仍落到 errors['mimo']，菜单显示「抓取失败」。
+# 症状：点「重新登录」把每站都登了一遍，别的站都好了，只有小米一直失败。
+AUTH_ERROR_CODES = ('登录状态已过期', 'unauthorized', 'token expired', '登录已失效',
+                    'mimo auth failed')
 
 
 def is_auth_error(exc):
@@ -95,15 +105,28 @@ def is_auth_error(exc):
     msg = str(exc).lower()
     if 'http error 401' in msg or 'http error 403' in msg:
         return True
-    return any(k in msg for k in AUTH_ERROR_CODES)
+    return any(k.lower() in msg for k in AUTH_ERROR_CODES)
 
 
 def token_fingerprint(reqs, site):
-    """取某站点当前 authorization 的指纹，用于判断「刷新是否真的换了新 token」。
+    """取某站点当前凭证的指纹，用于判断「刷新是否真的换了新 token」。
 
     返回短哈希而非原文，避免把凭证写进日志。
+
+    2026-11-11 修：原先只读 api-requests.json 的 authorization 头，
+    但不同站点的鉴权来源不同：
+      - bigmodel / kimi / deepseek → authorization 头（api-requests.json）
+      - minimax → data/minimax-auth.json 的 authorization
+      - mimo → data/mimo-session.json 的 session cookie
+        （api-platform_serviceToken / api-platform_ph）
+    mimo 走 authorization 路线恒得 None → refresh_auth_for 永远返回 False
+    → mimo 的自动刷新路径形同虚设。这里按站点取对应凭证。
     """
     import hashlib
+    if site == 'mimo':
+        return _mimo_fingerprint()
+    if site == 'minimax':
+        return _minimax_fingerprint()
     try:
         auth = reqs[site][0]['headers'].get('authorization', '')
     except (KeyError, IndexError, TypeError):
@@ -111,6 +134,46 @@ def token_fingerprint(reqs, site):
     if not auth:
         return None
     return hashlib.sha1(auth.encode()).hexdigest()[:10]
+
+
+def _mimo_fingerprint():
+    """mimo 的凭证指纹：session cookie（serviceToken + ph）。"""
+    import hashlib
+    sess_path = os.path.join(ROOT, 'data', 'mimo-session.json')
+    try:
+        sess = json.load(open(sess_path))
+        cookies = sess.get('cookies', {}).get('xiaomimimo.com', [])
+    except (OSError, ValueError, KeyError):
+        return None
+    pairs = []
+    for c in cookies:
+        if c.get('name') in ('api-platform_serviceToken', 'api-platform_ph'):
+            pairs.append('%s=%s' % (c['name'], c['value']))
+    if not pairs:
+        return None
+    return hashlib.sha1('|'.join(sorted(pairs)).encode()).hexdigest()[:10]
+
+
+def _minimax_fingerprint():
+    """minimax 的凭证指纹：会话 cookie（_token）。
+
+    minimax 同样不用 authorization 头（实测 minimax-auth.json 的
+    auth_headers 为空、requests[].headers 里也没有 authorization），
+    真正起作用的是 cookie 里的 _token。
+    """
+    import hashlib
+    path = os.path.join(ROOT, 'data', 'minimax-auth.json')
+    try:
+        d = json.load(open(path))
+        cookies = d.get('cookies', [])
+    except (OSError, ValueError, AttributeError):
+        return None
+    pairs = ['%s=%s' % (c.get('name'), c.get('value'))
+             for c in cookies if c.get('name') == '_token']
+    if not pairs:
+        return None
+    return hashlib.sha1('|'.join(sorted(pairs)).encode()).hexdigest()[:10]
+
 
 
 def refresh_auth_for(site, reqs):
