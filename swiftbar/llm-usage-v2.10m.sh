@@ -27,11 +27,17 @@
 #   菜单不 dismiss），由常驻进程自己识别点击：
 #     CGEventSource 检测真实 leftMouseUp（免辅助功能权限，合成事件不计入）
 #     → 枚举 layer=101 的 SwiftBar 菜单窗口，判定鼠标在菜单内
-#     → 截图中定位选中格的实心琥珀描边，得到条带精确屏幕位置
-#       （插件进程继承 SwiftBar 的屏幕录制权限；不可用时退化为几何推算）
+#     → 纯几何定位条带：条带是菜单第一个图项，其位置相对菜单窗口
+#       左缘/顶缘的偏移是**常量**（实测 dx=14, dyTop=8，AppKit 弹出真实
+#       NSMenu 量得，见 scripts/llm_bar_v2.py 的 MENU_IMG_INSET/MENU_BODY_TOP）
 #     → 鼠标 x 相对条带左缘的偏移命中哪个 logo 格 → 进程内直接切换 + 播动效
 #   菜单打开期间 SwiftBar 走 incrementalUpdateMenu 原地刷新，
 #   因此切换后菜单保持打开、进度条即时更新、动效连续。
+#
+#   注：早期实现用「全屏截图 + 搜琥珀描边」定位条带，本机不可用——
+#     macOS 15 已废弃 CGWindowListCreateImage；screencapture 在 TCC 下
+#     只能拍到壁纸（拍不到 layer=101 弹出菜单）；AX 未授权。
+#     故改为上面基于实测常量的纯几何定位。
 #
 # 动效（2026-11-10 追加）：
 #   切换 provider 时，状态栏 logo 做「缩放弹入 + 进度条填充」动画。

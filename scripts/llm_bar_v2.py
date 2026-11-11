@@ -34,14 +34,19 @@ SWITCH = os.path.join(ROOT, 'scripts', 'switch_model.sh')
 STATE = os.path.join(DATA, 'selected.json')
 LAST_RENDERED = os.path.join(DATA, '.last_rendered.json')
 CLICK_LOG = os.path.join(DATA, '.click_log.jsonl')
-# 菜单项图片左缘相对菜单窗口左缘的 inset（pt）。实测见 /tmp/testmenu/gray。
+# 菜单项图片左缘相对菜单窗口左缘的 inset（pt）。
+# 地面真值（/tmp/striptest/final.swift 实测，AppKit 弹出真实 NSMenu）：
+#   条带图 cgX - 窗口 cgX = 14   → MENU_IMG_INSET
+#   条带图 cgTop - 窗口 cgTop = 8 → MENU_BODY_TOP
+#   (8 = NSMenu popup 顶部 padding 5 + 图项内上边距 3)
 MENU_IMG_INSET = 14
-# 条带在菜单正文首行；正文前有「header 行 + separator 行」。
-# NSMenu popup 窗口顶部 padding ≈ 3pt，常规行高 22pt。
-# 推算值仅作 fallback，真实值由菜单打开时的自动标定覆盖（见 calibrate_strip）。
-MENU_BODY_TOP = 3 + 22 + 22
+# 条带图顶部相对菜单窗口顶部的偏移（pt）。实测 = 8，不是推算值。
+# 注意：条带是菜单的**第一个图项**，其上只有被 NSMenu 折叠掉的连续
+# separator，因此这个偏移与 body 行数 / provider 无关，是常量。
+MENU_BODY_TOP = 8
 STRIP_H = 19
-STRIP_Y_TOLERANCE = 8
+# Y 容差：条带行高 25（19 + 上下各 3），点击落在行内任意位置都算命中。
+STRIP_Y_TOLERANCE = 6
 FETCH_PY = os.path.join(ROOT, 'fetch.py')
 PY_BIN = sys.executable
 
@@ -192,9 +197,9 @@ def draw_logo_strip(active=15, inactive=12, gap=4, pad=2):
       的 image 不被灰化、保持原色，且点击 disabled 项不会触发任何
       performItemAction → 菜单不会 dismiss。
       点击由常驻进程自己探测：CGEventSource 检测真实 leftMouseUp 后，
-      枚举 layer=101 的 SwiftBar 菜单窗口 + 全屏截图像素比对，用
-      选中格的**实心琥珀描边**定位条带在菜单中的位置，再按 x 坐标
-      映射到具体 provider（几何来自本函数返回的 geometry）。
+      枚举 layer=101 的 SwiftBar 菜单窗口 → 纯几何定位条带（条带是菜单
+      第一个图项，相对窗口左缘/顶缘的偏移是实测常量 dx=14 / dyTop=8）
+      → 按鼠标 x 映射到具体 provider（几何来自本函数返回的 geometry）。
 
     返回 (png_bytes, geometry)；geometry: list of (x0, x1, key)。
     """
@@ -223,8 +228,7 @@ def draw_logo_strip(active=15, inactive=12, gap=4, pad=2):
                     pixels[i:i + 4] = bytes((c[0], c[1], c[2], 255))
         if m['key'] == _sel_hint[0]:
             # 选中格：实心琥珀描边（整圈 2px 粗边，连四角）。
-            # 必须实心闭合：截图像素定位靠「一条完整闭合的琥珀色矩形边」
-            # 匹配条带位置；虚线/断角会让闭合性检测失效。
+            # 琥珀色也用于人眼识别当前选中项（不再用于截图定位）。
             hl = (0xd4, 0xa8, 0x6a)
             bw = 2
             for yy in range(side):
@@ -243,8 +247,6 @@ def draw_logo_strip(active=15, inactive=12, gap=4, pad=2):
 _sel_hint = ['bigmodel']
 # 条带几何（draw_logo_strip 返回的 [(x0,x1,key),...]），给点击探测器用
 _strip_geom = [None]
-# 条带在屏幕上的标定位置 (strip_left, strip_top)，菜单一打开就自动校准
-_strip_pos = [None]
 # 点击探测状态：上次见到的 leftMouseUp 时间戳（秒）；None=尚未基线化
 _last_up_ts = [None]
 
@@ -376,162 +378,20 @@ def mouse_state():
         return (None, None, None)
 
 
-_AMBER = (0xd4, 0xa8, 0x6a)
-
-
-def _read_png_rgb(path):
-    """纯 Python 解码 8bit 非隔行 PNG，返回 (w, h, ch, rgb_bytes)。"""
-    import struct
-    import zlib
-    d = open(path, 'rb').read()
-    if d[:8] != b'\x89PNG\r\n\x1a\n':
-        raise ValueError('not png')
-    pos, idat, meta = 8, b'', {}
-    while pos < len(d):
-        ln = struct.unpack('>I', d[pos:pos + 4])[0]
-        typ = d[pos + 4:pos + 8]
-        data = d[pos + 8:pos + 8 + ln]
-        if typ == b'IHDR':
-            w, h, depth, ctype, _c, _f, inter = struct.unpack('>IIBBBBB', data)
-            meta = (w, h, depth, ctype, inter)
-        elif typ == b'IDAT':
-            idat += data
-        elif typ == b'IEND':
-            break
-        pos += 12 + ln
-    w, h, depth, ctype, inter = meta
-    if depth != 8 or inter != 0 or ctype not in (2, 6):
-        raise ValueError('unsupported png %r' % (meta,))
-    ch = 3 if ctype == 2 else 4
-    raw = zlib.decompress(idat)
-    stride = w * ch
-    out = bytearray(w * h * ch)
-    prev = bytearray(stride)
-    pos = 0
-    for y in range(h):
-        f = raw[pos]
-        pos += 1
-        line = bytearray(raw[pos:pos + stride])
-        pos += stride
-        if f == 1:
-            for i in range(ch, stride):
-                line[i] = (line[i] + line[i - ch]) & 0xff
-        elif f == 2:
-            for i in range(stride):
-                line[i] = (line[i] + prev[i]) & 0xff
-        elif f == 3:
-            for i in range(stride):
-                a = line[i - ch] if i >= ch else 0
-                line[i] = (line[i] + ((a + prev[i]) >> 1)) & 0xff
-        elif f == 4:
-            for i in range(stride):
-                a = line[i - ch] if i >= ch else 0
-                b = prev[i]
-                c = prev[i - ch] if i >= ch else 0
-                p = a + b - c
-                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
-                pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
-                line[i] = (line[i] + pr) & 0xff
-        out[y * stride:(y + 1) * stride] = line
-        prev = line
-    if ch == 4:
-        rgb = bytearray(w * h * 3)
-        for i in range(w * h):
-            rgb[i * 3:i * 3 + 3] = out[i * 4:i * 4 + 3]
-        return w, h, 3, bytes(rgb)
-    return w, h, 3, bytes(out)
-
-
-def locate_strip_on_screen(timeout=3.0):
-    """在打开的 SwiftBar 菜单里找条带：全屏截图 + 搜实心琥珀描边矩形。
-
-    返回条带图左上角的屏幕坐标 (sx, sy)，找不到返回 None。
-    选中格描边是 12~15px 见方、2px 粗的琥珀实心边框 —— 全屏里几乎唯一。
-    """
-    import subprocess
-    cap = '/tmp/llm_bar_cap.png'   # screencapture 拒绝写点前缀隐藏文件名
-    try:
-        t0 = time.time()
-        subprocess.run(['screencapture', '-x', cap],
-                       check=True, timeout=timeout)
-        w, h, ch, px = _read_png_rgb(cap)
-    except Exception:
-        return None
-    # 扫描：琥珀色像素的行/列直方图 → 找 12~16px 见方的实心边框。
-    # 等价于找「连续 run 长度 12~16 且上边+下边平行」的行段。
-    amber_rows = {}   # y -> [x0, x1]（该行琥珀像素的最左/最右）
-    amber_rows_n = {}
-    for y in range(0, h, 1):
-        xs = None
-        # 逐行找琥珀 run：允许 ±8 色差（截图有色彩管理偏移）
-        x = 0
-        while x < w:
-            i = (y * w + x) * 3
-            if (abs(px[i] - _AMBER[0]) <= 10 and abs(px[i + 1] - _AMBER[1]) <= 10
-                    and abs(px[i + 2] - _AMBER[2]) <= 10):
-                j = x
-                while j < w:
-                    k = (y * w + j) * 3
-                    if not (abs(px[k] - _AMBER[0]) <= 10
-                            and abs(px[k + 1] - _AMBER[1]) <= 10
-                            and abs(px[k + 2] - _AMBER[2]) <= 10):
-                        break
-                    j += 1
-                run = j - x
-                if 11 <= run <= 17:   # 选中格边长 12/15（±1px 渲染误差）
-                    if xs is None:
-                        xs = []
-                    xs.append((x, j - 1))
-                x = j
-            else:
-                x += 1
-        if xs:
-            amber_rows[y] = xs
-            amber_rows_n[y] = len(xs)
-    # 找「上边（整行连续 run）+ 下边（同 x 范围）」配对，间距 10~14
-    ys = sorted(amber_rows.keys())
-    for i, y1 in enumerate(ys):
-        for (a1, b1) in amber_rows[y1]:
-            if b1 - a1 < 11:
-                continue
-            for y2 in ys[i + 1:]:
-                if not (10 <= y2 - y1 <= 14):
-                    if y2 - y1 > 14:
-                        break
-                    continue
-                for (a2, b2) in amber_rows[y2]:
-                    if abs(a2 - a1) <= 2 and abs(b2 - b1) <= 2:
-                        # 竖边在逐行扫描里已包含（每行都有 xs），
-                        # 统计 y1..y2 之间行数占比 >= 60% 即闭合边框
-                        rows_between = [y for y in ys
-                                        if y1 < y < y2
-                                        and any(abs(a - a1) <= 2
-                                                for (a, _b) in amber_rows[y])]
-                        if len(rows_between) >= (y2 - y1 - 1) * 0.6:
-                            return (a1, y1)
-                        break
-                else:
-                    continue
-                break
-        if time.time() - t0 > timeout:
-            break
-    return None
-
-
 def handle_menu_click(prev_sel):
     """点击探测主入口。返回应切换到的 provider key，无切换返回 None。
 
     判定链：
       1. 出现「新的」真实 leftMouseUp（时间戳比上次记录的新）
       2. 此刻鼠标坐标落在某个 layer=101 SwiftBar 菜单窗口内
-      3. 定位条带左缘：
-         a. 首选截图：在截图中找实心琥珀描边（精确，但依赖屏幕录制授权）
-         b. fallback 几何推算：条带左缘 = 菜单窗口 x + MENU_IMG_INSET
+      3. 定位条带：纯几何。条带是菜单第一个图项，其位置相对菜单窗口
+         左缘/顶缘的偏移是常量（实测 dx=14 / dyTop=8），与 body 行数、
+         provider、菜单总高都无关。
       4. 鼠标 x 相对条带左缘的偏移命中 geometry 的哪个格子
       5. 该格子不是当前选中 → 返回目标 key
 
-    每次新点击都会写一条 CLICK_LOG 标定日志（点击坐标/窗口/定位结果/
-    命中格子），真实环境跑一次即可核对 fallback 常数是否需要修正。
+    每次新点击都会写一条 CLICK_LOG 日志（点击坐标/窗口/定位结果/
+    命中格子），用于真实环境核对。
     """
     mx, my, up = mouse_state()
     if mx is None:
@@ -556,25 +416,16 @@ def handle_menu_click(prev_sel):
     if not geom:
         return None
 
-    # ---- 定位条带左缘（标定缓存 > 截图 > 几何 fallback）----
-    cached = _strip_pos[0]
-    if cached is not None:
-        strip_left, strip_top = cached
-        method = 'calibrated'
-    else:
-        pos = locate_strip_on_screen()
-        if pos is not None:
-            sx, sy = pos
-            sel_i = next((i for i, (x0, x1, k) in enumerate(geom)
-                          if k == prev_sel), 0)
-            strip_left = sx - geom[sel_i][0]     # 描边左缘反推条带左缘
-            strip_top = sy
-            method = 'screenshot'
-        else:
-            wx, wy, ww, wh = win
-            strip_left = wx + MENU_IMG_INSET
-            strip_top = wy + MENU_BODY_TOP
-            method = 'geometry'
+    # ---- 定位条带左缘：纯几何（实测常量）----
+    # 条带是菜单第一个图项，相对菜单窗口的偏移是常量：
+    #   左缘 = 窗口 x + MENU_IMG_INSET(14)
+    #   顶缘 = 窗口 y + MENU_BODY_TOP(8)
+    # 这两个值由 AppKit 实测得出（/tmp/striptest/final.swift），
+    # 与 body 行数 / provider / 菜单总高无关。
+    wx, wy, ww, wh = win
+    strip_left = wx + MENU_IMG_INSET
+    strip_top = wy + MENU_BODY_TOP
+    method = 'geometry'
 
     # Y 约束：鼠标必须落在条带行内（否则点到菜单其它行会被误判为切换）
     if not (strip_top - STRIP_Y_TOLERANCE <= my
@@ -601,35 +452,6 @@ def handle_menu_click(prev_sel):
     if hit and hit != prev_sel:
         return hit
     return None
-
-
-def calibrate_strip():
-    """菜单打开时自动标定条带位置，缓存到 _strip_pos。
-
-    插件进程是 SwiftBar 子进程，继承 SwiftBar 的屏幕录制权限，
-    因此 screencapture 在插件内可用（沙箱 shell 里不可用）。
-    返回 (strip_left, strip_top) 或 None。
-    """
-    wins = find_menu_windows()
-    if not wins:
-        return None
-    geom = _strip_geom[0]
-    if not geom:
-        return None
-    pos = locate_strip_on_screen()
-    if pos is None:
-        return None
-    sx, sy = pos
-    sel_key = _sel_hint[0]
-    sel_i = next((i for i, (x0, x1, k) in enumerate(geom)
-                  if k == sel_key), 0)
-    strip_left = sx - geom[sel_i][0]
-    _strip_pos[0] = (strip_left, sy)
-    _log_click({'calibration': True, 'strip_left': strip_left, 'strip_top': sy,
-                'method': 'screenshot',
-                'wins': [(int(x), int(y), int(w), int(h))
-                         for (_n, x, y, w, h) in wins]})
-    return _strip_pos[0]
 
 
 def _log_click(info):
@@ -974,9 +796,10 @@ def render_dropdown(data, errors, sel):
     #   - SwiftBar buildMenuItem：无 action 且无 color 的项 item.action=nil
     #     → 点击不触发 performItemAction → 菜单不会 dismiss；
     #   - 点击探测由常驻进程自己做（见主循环 CLICK_DETECT 段）：
-    #     CGEventSource 检测真实 leftMouseUp（免辅助功能权限、合成事件
-    #     不计入）→ 枚举 layer=101 SwiftBar 菜单窗口 → screencapture
-    #     全屏截图像素比对实心琥珀描边定位条带 → 鼠标 x 相对条带左缘的
+    #     CGEventSource 检测真实 leftMouseUp（免辅助功能权限，合成事件
+    #     不计入）→ 枚举 layer=101 SwiftBar 菜单窗口 → 纯几何定位条带
+    #     （条带是菜单第一个图项，相对窗口的偏移是实测常量 dx=14/dyTop=8，
+    #     与 body 行数/provider/菜单总高无关）→ 鼠标 x 相对条带左缘的
     #     偏移命中 geometry 里的哪个 provider → 进程内直接切换+动效。
     #   - 点击落在菜单内但条带外 / 点在菜单外：静默忽略。
     _sel_hint[0] = sel
@@ -1160,15 +983,12 @@ def main():
             # 条带是无 action 的图片项（点击不触发任何 SwiftBar 动作、
             # 菜单不 dismiss），由本进程自己识别「用户点了哪个 logo」：
             #   新的真实 leftMouseUp + 鼠标在 SwiftBar 菜单窗口内
-            #   → 截图定位实心琥珀描边（条带）→ 按 x 命中 geometry 格子。
+            #   → 纯几何定位条带（实测常量）→ 按 x 命中 geometry 格子。
             # 开销控制：空闲期每 0.5s 一次 mouse_state（纯 ctypes 读，~0ms），
-            # 只在「新的点击 + 在菜单内」时才付出一次 screencapture（~80ms）。
+            # 全程无截图、无辅助功能权限依赖。
             # 菜单还开着时 SwiftBar 走 incrementalUpdateMenu 原地刷新，
             # 菜单不会收起，动效连续。
             try:
-                # 菜单一出现就自动标定条带位置（截图一次，之后复用）
-                if _strip_pos[0] is None and find_menu_windows():
-                    calibrate_strip()
                 hit = handle_menu_click(prev_sel)
             except Exception:
                 hit = None
