@@ -67,9 +67,30 @@ MODELS = [
 MODEL_BY_KEY = {m['key']: m for m in MODELS}
 MODEL_ORDER = [m['key'] for m in MODELS]
 
+# 站点配色（沿用 v1 swiftbar/llm-usage.10m.sh 的 SITE_COLORS）：
+#   Kimi = 粉，Kimi Code = 紫 —— 两者在同一分组下必须视觉可分。
+SITE_COLORS = {
+    'bigmodel':  (0x7d, 0x96, 0xb5),
+    'kimi':      (0xc8, 0x9a, 0x9a),   # 粉
+    'kimi-code': (0xa5, 0x94, 0xb8),   # 紫
+    'minimax':   (0x8f, 0xb0, 0x8f),
+    'deepseek':  (0x6b, 0x9a, 0xa8),
+    'mimo':      (0xc9, 0xa8, 0x8a),
+}
+
+
+def site_color(site):
+    """取站点主色；未知站点回落到所属 provider 的颜色。"""
+    if site in SITE_COLORS:
+        return SITE_COLORS[site]
+    base = site.split('-')[0]
+    return SITE_COLORS.get(base, (0x70, 0x70, 0x70))
+
+
 CONSOLE = {
     'bigmodel': 'https://bigmodel.cn/coding-plan/personal/usage',
     'kimi':     'https://www.kimi.com/membership/subscription?tab=quota',
+    'kimi-code': 'https://www.kimi.com/membership/subscription?tab=quota',
     'minimax':  'https://platform.minimax.cn/console/usage',
     'deepseek': 'https://platform.deepseek.com/usage',
     'mimo':     'https://platform.xiaomimimo.com/console/plan-manage?edition=PERSONAL',
@@ -184,6 +205,50 @@ def draw_bar(pct, width, height=16, base=None):
                 pixels[i:i + 4] = bytes((c[0], c[1], c[2], 255))
             else:
                 pixels[i:i + 4] = bytes((bg[0], bg[1], bg[2], 255))
+    return png_bytes(width, height, bytes(pixels))
+
+
+def draw_segmented_bar(kimi_pct, code_pct, width=220, height=16):
+    """Kimi 订阅总额进度条：已用部分按比例切成 Kimi(粉) + Code(紫)，剩余为底色。
+
+    语义与 v1 一致：
+      kimi_pct = 已用总量（kimi/billing 的 amountUsedRatio）
+      code_pct = Code 已用（kimi-code/billing）
+      Code 在**已用部分**中的占比 = code_pct / kimi_pct
+    """
+    bg = (0xec, 0xe8, 0xe1)
+    kimi_pct = kimi_pct or 0
+    code_pct = code_pct or 0
+    total_used_w = round(width * min(100, kimi_pct) / 100)
+    code_share = (code_pct / kimi_pct) if kimi_pct > 0 else 0
+    code_w = min(round(total_used_w * code_share), total_used_w)
+    kimi_seg = total_used_w - code_w
+    # 非零段保底 2px，避免某一方占比极小时该颜色完全不可见
+    # （实测 Kimi 只占 0.2% 时粉段宽 0，条子看起来像纯紫）
+    if kimi_seg == 0 and total_used_w > 0 and (kimi_pct - code_pct) > 0:
+        kimi_seg = min(2, total_used_w)
+        code_w = total_used_w - kimi_seg
+    elif code_w == 0 and total_used_w > 0 and code_pct > 0:
+        code_w = min(2, total_used_w)
+        kimi_seg = total_used_w - code_w
+    kimi_color = SITE_COLORS['kimi']
+    code_color = SITE_COLORS['kimi-code']
+    kimi_hi = lerp(kimi_color, (255, 255, 255), 0.18)
+    kimi_lo = lerp(kimi_color, (0, 0, 0), 0.15)
+    code_hi = lerp(code_color, (255, 255, 255), 0.18)
+    code_lo = lerp(code_color, (0, 0, 0), 0.15)
+    pixels = bytearray(width * height * 4)
+    for y in range(height):
+        t = y / max(1, height - 1)
+        for x in range(width):
+            i = (y * width + x) * 4
+            if x < kimi_seg:
+                c = lerp(kimi_hi, kimi_lo, t)
+            elif x < kimi_seg + code_w:
+                c = lerp(code_hi, code_lo, t)
+            else:
+                c = bg
+            pixels[i:i + 4] = bytes((c[0], c[1], c[2], 255))
     return png_bytes(width, height, bytes(pixels))
 
 
@@ -826,23 +891,34 @@ def render_dropdown(data, errors, sel):
         if sel == 'bigmodel':
             out.append('可试试底部「从 Chrome 同步登录态」 | size=11 color=#8a8680')
 
-    def show_site(site, title):
+    def show_site(site, title, seg=None):
         rs = rows_of(data_rows, site)
+        col = site_color(site)
         if not rs:
             out.append('---')
-            out.append(title + ' | size=13 color=' + hexc(model['color'])
+            out.append(title + ' | size=13 color=' + hexc(col)
                        + ' href=' + CONSOLE.get(site, ''))
             out.append('   数据不可用 | size=12 color=#8a8680')
             return
         out.append('---')
-        out.append(title + ' | size=13 color=' + hexc(model['color'])
+        out.append(title + ' | size=13 color=' + hexc(col)
                    + ' href=' + CONSOLE.get(site, ''))
+        if seg:
+            # v1 的 Kimi 合并视图：顶部一条分段总用量条（粉=Kimi / 紫=Code）
+            k_pct, c_pct = seg
+            out.append(' | image=' + b64(draw_segmented_bar(k_pct, c_pct, 220, 18)))
+            out.append('   总使用量  %.1f%%     🟥Kimi %.1f%%  🟪Code %.1f%%'
+                       % (k_pct, max(0.0, k_pct - c_pct), c_pct)
+                       + ' | size=12 color=#8a8680')
         for r in rs:
             w = r['window']
             label = WINDOW_NAMES.get(w, w)
             pct = r.get('used_pct')
             if pct is not None:
-                bar = draw_bar(pct, 220, 16, model['color'])
+                if seg and site == 'kimi' and w == 'billing':
+                    # 已用总量已由上方分段条表达，这里不重复画单色条
+                    continue
+                bar = draw_bar(pct, 220, 16, col)
                 out.append(' | image=' + b64(bar))
                 extra = ''
                 if r.get('total'):
@@ -878,7 +954,12 @@ def render_dropdown(data, errors, sel):
                            + ' | size=12 color=#3f3e3b')
 
     if sel == 'kimi':
-        show_site('kimi', 'Kimi（订阅总额）')
+        k_bill = pct_of(data_rows, 'kimi', 'billing')
+        c_bill = pct_of(data_rows, 'kimi-code', 'billing')
+        if k_bill is not None and c_bill is not None:
+            show_site('kimi', 'Kimi（订阅总额）', seg=(k_bill, c_bill))
+        else:
+            show_site('kimi', 'Kimi（订阅总额）')
         if rows_of(data_rows, 'kimi-code'):
             show_site('kimi-code', 'Kimi Code（编程额度）')
     else:
