@@ -23,6 +23,7 @@ import select as select_mod
 import struct
 import subprocess
 import sys
+import threading
 import time
 import zlib
 from datetime import datetime
@@ -764,6 +765,25 @@ def write_last_rendered(model):
         pass
 
 
+# 心跳落盘（可观测性）：每轮主循环都写一次。
+# 用途：判断「主循环是否活着」——空闲期帧内容不变会被去重，frames 不涨，
+# 但心跳时间戳必须持续更新。之前卡在同步 fetch 上时，正是靠心跳停止
+# 才定位到「主循环被阻塞」。
+HEARTBEAT = os.path.join(DATA, '.heartbeat.json')
+
+
+def write_heartbeat(sel, fetching=False):
+    try:
+        os.makedirs(DATA, exist_ok=True)
+        tmp = HEARTBEAT + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump({'at': datetime.now().isoformat(), 'model': sel,
+                       'fetching': bool(fetching)}, f)
+        os.replace(tmp, HEARTBEAT)
+    except Exception:
+        pass
+
+
 # 帧计数落盘（可观测性）：用于排查「菜单栏闪烁」这类问题 ——
 #   直接读这个文件就知道插件实际向 SwiftBar 提交了多少帧、最后一帧何时提交。
 #   空闲期（内容不变）不应再提交帧，若 frames 持续快速增长即为刷屏。
@@ -808,8 +828,80 @@ def log_stdin(cmd):
 SNAPSHOT_MAX_AGE = 60       # 快照超过 60 秒才重新采集（用户要求每分钟取一次）
 
 
+class FetchRunner:
+    """后台采集器：把 fetch.py 放到子线程跑，主循环永不阻塞。
+
+    2026-11-12 修（关键）：
+      原实现 `fetch_data()` 直接 `subprocess.run(fetch.py)`，**同步阻塞主循环**。
+      fetch.py 内部要跑 Playwright 浏览器脚本（deepseek_discover.js 等），
+      单次可耗时 30~120 秒。这段时间主循环完全卡死 →
+        - 点击探测（handle_menu_click）不执行 → **所有 logo 都点不动**
+        - 帧不再输出 → SwiftBar 状态栏空白
+      表现就是「某个 session 挂了之后别的 logo 也点不了」——其实与 kimi 无关，
+      任何站点触发慢刷新（鉴权失败 → 浏览器刷新）都会拖垮整个菜单。
+
+      现在改为：主循环只在「数据陈旧」时**发起**一次后台采集（非阻塞），
+      采集结果放进 _result，下一轮主循环 poll 走。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._result = None       # (ts, data)
+        self._running = False
+
+    def _worker(self):
+        try:
+            data = self._do_fetch()
+        except Exception:
+            data = {'rows': [], 'errors': {}}
+        with self._lock:
+            self._result = (time.time(), data)
+            self._running = False
+
+    def _do_fetch(self):
+        try:
+            p = subprocess.run([PY_BIN, FETCH_PY, '--json'],
+                               cwd=ROOT, capture_output=True, timeout=300)
+            out = p.stdout.decode(errors='replace').strip()
+            if out:
+                return json.loads(out)
+        except Exception:
+            pass
+        try:
+            with open(os.path.join(DATA, 'latest.json')) as f:
+                return json.load(f)
+        except Exception:
+            return {'rows': [], 'errors': {}}
+
+    def start(self):
+        """发起一次采集（非阻塞）。已在跑则忽略。"""
+        with self._lock:
+            if self._running:
+                return False
+            self._running = True
+        threading.Thread(target=self._worker, daemon=True).start()
+        return True
+
+    def poll(self):
+        """取走采集结果（若有），返回 (ts, data) 或 None。"""
+        with self._lock:
+            if self._result is None:
+                return None
+            ts, data = self._result
+            self._result = None
+            return ts, data
+
+    @property
+    def running(self):
+        with self._lock:
+            return self._running
+
+
+FETCHER = FetchRunner()
+
+
 def fetch_data(force=False):
-    """取用量数据。
+    """取用量数据（同步版，仅供启动首帧与测试使用）。
 
     优先直接读 data/latest.json 快照（v1 插件也读这个文件），
     快照过期或缺失时才真正跑 fetch.py —— 避免每次刷新都起一轮
@@ -831,7 +923,7 @@ def fetch_data(force=False):
 
     try:
         p = subprocess.run([PY_BIN, FETCH_PY, '--json'],
-                           cwd=ROOT, capture_output=True, timeout=180)
+                           cwd=ROOT, capture_output=True, timeout=300)
         out = p.stdout.decode(errors='replace').strip()
         if out:
             return json.loads(out)
@@ -1033,9 +1125,18 @@ def render_dropdown(data, errors, sel):
 
 def main():
     global data_rows
-    data = fetch_data()
+    # 启动时先读现成快照（瞬间），再后台发起一轮采集。
+    # 2026-11-12：原来这里同步跑 fetch_data()，启动就被 Playwright 阻塞几十秒。
+    data = {}
+    try:
+        with open(os.path.join(DATA, 'latest.json')) as f:
+            data = json.load(f)
+    except Exception:
+        data = {'rows': [], 'errors': {}}
     data_rows = data.get('rows', [])
     errors = data.get('errors', {})
+    # 启动即后台发起一轮采集（不阻塞首帧输出）
+    FETCHER.start()
 
     # 上次渲染的 provider 记到独立文件里：
     # 插件进程被 SwiftBar 重启后，仍能知道「换过 provider」并补播动效。
@@ -1051,7 +1152,6 @@ def main():
     write_last_rendered(prev_sel)
 
     last_data_refresh = time.time()
-    idle_tick = 0
     last_frame = None          # 上一次输出的完整帧内容（去重用）
     stdin_buf = ''             # SwiftBar stdin= 协议：点击回传的命令缓冲
     frame_count = 0            # 已提交帧计数（写 .frame_stat.json 供观测）
@@ -1071,14 +1171,11 @@ def main():
                 prev_sel = target
                 anim_t = 0.0
         elif cmd == 'refresh':
-            # 手动刷新：立即重新采集（不重启 streamable 进程，
+            # 手动刷新：立即**发起**一次采集（不重启 streamable 进程，
             # 否则进程一死菜单栏会短暂变空白 / ! ）。
-            try:
-                data = fetch_data(force=True)
-                data_rows = data.get('rows', [])
-                errors = data.get('errors', {})
-            except Exception:
-                pass
+            # 2026-11-12：原来这里同步跑 fetch.py（可能 30~120 秒），
+            # 会把主循环卡死 → 点击探测停摆 → logo 全部点不动。改后台。
+            FETCHER.start()
 
     while True:
         try:
@@ -1199,14 +1296,24 @@ def main():
             prev_model = None
             write_last_rendered(prev_sel)
 
-            # ---- 空闲期：快速轮询选择变化 + 定期刷新数据 ----
-            idle_tick += 1
-            if idle_tick % IDLE_TICKS == 0:
-                # 刷新数据（fetch_data 内部按快照年龄判断是否真采集）
-                data = fetch_data()
+            # ---- 后台采集结果回收 + 过期触发 ----
+            # 2026-11-12：采集改成后台线程。旧实现同步跑 fetch.py，
+            # 而 fetch.py 可能要跑 Playwright（30~120 秒）→ 主循环卡死 →
+            # 点击探测停摆 → 所有 logo 都点不动。现在只「发起」不「等待」。
+            #
+            # poll 每轮都做（只是一次加锁，纳秒级），保证手动刷新后
+            # 结果一回来就立刻反映到菜单，不用等下一个刷新周期。
+            got = FETCHER.poll()
+            if got:
+                data = got[1]
                 data_rows = data.get('rows', [])
                 errors = data.get('errors', {})
                 last_data_refresh = time.time()
+            # 数据陈旧且当前没有采集在跑 → 发起一轮（不阻塞）
+            if time.time() - last_data_refresh > SNAPSHOT_MAX_AGE:
+                FETCHER.start()
+
+            write_heartbeat(prev_sel, FETCHER.running)
             time.sleep(IDLE_POLL_INTERVAL)
         except Exception:
             # 常驻流插件：任何一帧渲染抛异常都不能让进程死掉，

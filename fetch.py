@@ -515,6 +515,21 @@ def fetch_deepseek(reqs):
     # 但 deepseek 的真实抓包由 deepseek_discover.js 自己负责，子进程通过 Playwright persistent context
     # 复用登录态（localStorage isAuthenticated:true），不依赖 api-requests.json 里的 deepseek 数组。
 
+    # 2026-11-12 加缓存：deepseek_discover.js 每次要起 Playwright（30~120 秒），
+    # 而 deepseek 的数据是「余额 + 当日消费」，分钟级精度没意义。
+    # 原实现每轮采集都跑一遍 → 采集周期恒定 30 秒以上，还把浏览器资源占满。
+    # 这里改成：结果文件在 DEEPSEEK_CACHE_TTL 内就直接复用。
+    DEEPSEEK_CACHE_TTL = 600      # 10 分钟
+    try:
+        age = time.time() - os.path.getmtime(rows_path)
+        if age < DEEPSEEK_CACHE_TTL:
+            payload = json.load(open(rows_path))
+            cached_rows = [{'site': 'deepseek', **r} for r in payload.get('rows', [])]
+            if cached_rows:
+                return cached_rows
+    except Exception:
+        pass
+
     env = dict(os.environ,
                NODE_PATH='/Users/hanamaki_mac_mini/.workbuddy/binaries/node/workspace/node_modules')
     node = '/opt/homebrew/bin/node'

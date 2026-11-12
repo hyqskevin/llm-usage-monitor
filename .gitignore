@@ -27,3 +27,4 @@ data/*.png
 data/deepseek-dom.json
 data/deepseek-rows.json
 .workbuddy/
+data/.heartbeat.json
