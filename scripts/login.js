@@ -41,6 +41,9 @@ const SITES = [
     apiValid: (t) => t.includes('ratelimitCode5h') || t.includes('subscriptionBalance'),
     // kimi 的页面会自发请求该接口并带 authorization，被动捕获即可；
     // 这里不配 probeUrl（实测主动 fetch 反而拿不到 authorization）。
+    // 2026-11-12：kimi 未登录时不跳 /login，而是重定向回裸首页 ——
+    // 纯 URL 判据会误报「已登录」，用 homeRedirect 兜底（见 check()）。
+    homeRedirect: 'https://www.kimi.com/',
   },
   {
     key: 'minimax', name: 'MiniMax',
@@ -152,9 +155,15 @@ const SITES = [
 
   // 判定：未被重定向到登录页 = 已登录；被重定向 = 未登录。
   // 接口命中只作为补充证据（bigmodel 的接口不自动发起，只能靠 URL 判定）。
+  //
+  // 2026-11-12 修：kimi 未登录时**不跳登录页**，而是把受保护页重定向回
+  // 首页（www.kimi.com/），URL 判据永远为真 → --check 误报「✅ 已登录」。
+  // 给 kimi 加 homeRedirect 判据：目标页带着 ?tab=quota 打开、几秒后
+  // 落在裸首页 = 登录态被踢。
   const check = (site) => {
     const url = pages[site.key].url();
     if (site.loginUrlRe.test(url)) return false;
+    if (site.homeRedirect && url === site.homeRedirect) return false;
     return true;
   };
 
