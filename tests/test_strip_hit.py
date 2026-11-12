@@ -192,11 +192,49 @@ def test_handle_menu_click():
               'rel=%s want=%s got=%s' % (rel, expect, r))
 
 
+def test_pick_strip_window():
+    """多窗口场景：v1 与 v2 的菜单窗口同时存在时，必须选中含条带的那个。
+
+    2026-11-12 实测的真实数据：
+      11:35:38  wins=[[1138, 25, 235, 396]]  strip_left=1152 → 命中 mimo
+      11:35:41  wins=[[1095, 25, 355, 418]]  strip_left=1109 → 未命中
+    旧实现用「第一个包含鼠标的窗口」，会选到 v1 的菜单（宽 355），
+    条带起始 X 算错 43px → 点 v2 的 logo 落空 → 「有时能切有时不能」。
+    """
+    print('test_pick_strip_window')
+    geom = geom_for('bigmodel')
+    m._strip_geom[0] = geom
+    m._strip_w[0] = 154
+
+    # 场景 A：只有 v2 菜单窗口
+    v2 = (1138, 25, 235, 396)
+    w = m.pick_strip_window([(7,) + v2], 1138 + 14 + 140, 40)
+    check('单窗口 → 选中它', w == v2, str(w))
+
+    # 场景 B：v1(宽355, x=1095) 与 v2(宽235, x=1138) 同时存在，
+    #         鼠标点在 v2 的 mimo logo 上（x≈1295）
+    v1 = (1095, 25, 355, 418)
+    wins = [(1,) + v1, (2,) + v2]
+    mx = 1295
+    w = m.pick_strip_window(wins, mx, 40)
+    check('多窗口 → 选含条带的 v2', w == v2,
+          'got %s (v1=%s v2=%s)' % (w, v1, v2))
+
+    # 场景 C：鼠标点在 v1 菜单区域内但不落在任何条带 → 退回第一个候选
+    mx2 = 1095 + 14 + 10
+    w2 = m.pick_strip_window(wins, mx2, 40)
+    check('多窗口 → 无条带覆盖时退回候选', w2 in (v1, v2), str(w2))
+
+    # 场景 D：鼠标不在任何窗口内 → None
+    check('窗口外 → None', m.pick_strip_window(wins, 100, 900) is None)
+
+
 if __name__ == '__main__':
     test_geometry()
     test_hit_mapping()
     test_constants()
     test_handle_menu_click()
+    test_pick_strip_window()
     print()
     if FAILED:
         print('FAILED: %d' % len(FAILED))

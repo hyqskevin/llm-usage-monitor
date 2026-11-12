@@ -132,7 +132,22 @@ check('Kimi 只占 0.17% 时粉段仍可见(≥2px)', pink >= 2, 'pink=%d' % pin
 check('紫段仍占主体', purple > 100, 'purple=%d' % purple)
 
 print('== 菜单渲染 ==')
-data = json.load(open(os.path.join(ROOT, 'data', 'latest.json')))
+# 用自造数据，不依赖实时 latest.json —— 某站 401/抓不到时测试不该跟着挂。
+FAKE = {
+    'ts': '2026-11-12T00:00:00+00:00',
+    'rows': [
+        {'site': 'kimi', 'window': 'billing', 'used_pct': 50.54},
+        {'site': 'kimi-code', 'window': '5h', 'used_pct': 0.03},
+        {'site': 'kimi-code', 'window': 'week', 'used_pct': 51.92},
+        {'site': 'kimi-code', 'window': 'billing', 'used_pct': 50.37},
+        {'site': 'bigmodel', 'window': '5h', 'used_pct': 18.0},
+        {'site': 'minimax', 'window': '5h', 'used_pct': 53.0},
+        {'site': 'mimo', 'window': 'billing', 'used_pct': 100.3},
+        {'site': 'deepseek', 'window': 'today', 'used_pct': None},
+    ],
+    'errors': {},
+}
+data = FAKE
 out = m.render_dropdown(data, {}, 'kimi')
 titles = [l for l in out if 'size=13 color=' in l]
 code_title = [l for l in titles if 'Kimi Code' in l]

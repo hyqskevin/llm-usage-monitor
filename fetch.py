@@ -14,6 +14,7 @@ import os
 import sqlite3
 import sys
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -24,12 +25,46 @@ UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
 
 WINDOWS = ('5h', 'week', 'billing')
 
+# 国内站点直连，不走系统代理。
+#
+# 背景：macOS 环境里常驻 HTTP_PROXY/HTTPS_PROXY 环境变量（Stash 等代理工具
+# 会写入 shell profile），而 urllib.request.urlopen 默认读取这些环境变量
+# → 所有抓取请求都被塞进 127.0.0.1:7890。代理一挂，全部站点同时报
+# "Connection refused"，看起来像采集器坏了。
+#
+# 实际上这些平台全部在国内，直连更快也不该受代理存活影响。
+# 做法：自建 opener。国内域名用 ProxyHandler({}) 明确禁用代理；
+# 其余域名仍走环境代理（登录/刷新脚本需要访问境外资源时不影响）。
+DIRECT_DOMAINS = (
+    'bigmodel.cn',
+    'kimi.com',
+    'moonshot.cn',
+    'minimax.cn',
+    'minimaxi.com',
+    'deepseek.com',
+    'xiaomimimo.com',
+)
+
+# 不带代理的 opener（ProxyHandler({}) = 明确不走任何代理）
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def is_direct_domain(url):
+    """该 URL 是否属于强制直连的国内站点。"""
+    try:
+        host = urllib.parse.urlsplit(url).hostname or ''
+    except ValueError:
+        return False
+    host = host.lower()
+    return any(host == d or host.endswith('.' + d) for d in DIRECT_DOMAINS)
+
 
 def http(method, url, headers=None, body=None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method,
                                  headers={'User-Agent': UA, **(headers or {})})
-    with urllib.request.urlopen(req, timeout=25) as r:
+    opener = _DIRECT_OPENER if is_direct_domain(url) else urllib.request.build_opener()
+    with opener.open(req, timeout=25) as r:
         return json.loads(r.read().decode())
 
 
@@ -115,8 +150,9 @@ def token_fingerprint(reqs, site):
 
     2026-11-11 修：原先只读 api-requests.json 的 authorization 头，
     但不同站点的鉴权来源不同：
-      - bigmodel / kimi / deepseek → authorization 头（api-requests.json）
-      - minimax → data/minimax-auth.json 的 authorization
+      - bigmodel / kimi → authorization 头（api-requests.json）
+      - deepseek → 会话 cookie（data/cookies.json 的 deepseek.com）
+      - minimax → data/minimax-auth.json 的 _token cookie
       - mimo → data/mimo-session.json 的 session cookie
         （api-platform_serviceToken / api-platform_ph）
     mimo 走 authorization 路线恒得 None → refresh_auth_for 永远返回 False
@@ -127,6 +163,8 @@ def token_fingerprint(reqs, site):
         return _mimo_fingerprint()
     if site == 'minimax':
         return _minimax_fingerprint()
+    if site == 'deepseek':
+        return _deepseek_fingerprint()
     try:
         auth = reqs[site][0]['headers'].get('authorization', '')
     except (KeyError, IndexError, TypeError):
@@ -174,6 +212,29 @@ def _minimax_fingerprint():
         return None
     return hashlib.sha1('|'.join(sorted(pairs)).encode()).hexdigest()[:10]
 
+
+
+def _deepseek_fingerprint():
+    """deepseek 的凭证指纹：会话 cookie。
+
+    deepseek 的内部 API 用 cookie 鉴权，api-requests.json 里的
+    deepseek 请求头**没有** authorization（实测只有 x-client-* 等），
+    所以走 authorization 路线恒得 None。
+    """
+    import hashlib
+    try:
+        d = json.load(open(os.path.join(ROOT, 'data', 'cookies.json')))
+        cookies = d.get('cookies', {}).get('deepseek.com', [])
+    except (OSError, ValueError, KeyError, AttributeError):
+        return None
+    pairs = []
+    for c in cookies:
+        name = c.get('name')
+        if name and c.get('value'):
+            pairs.append('%s=%s' % (name, c['value']))
+    if not pairs:
+        return None
+    return hashlib.sha1('|'.join(sorted(pairs)).encode()).hexdigest()[:10]
 
 
 def refresh_auth_for(site, reqs):

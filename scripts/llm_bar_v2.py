@@ -51,10 +51,20 @@ STRIP_Y_TOLERANCE = 8
 FETCH_PY = os.path.join(ROOT, 'fetch.py')
 PY_BIN = sys.executable
 
-# 空闲期轮询：每 0.5 秒检查一次选择变化（让点击切换的动效立刻出现），
-# 每 IDLE_TICKS 次（≈60 秒）刷新一次数据。
-IDLE_POLL_INTERVAL = 0.5
-IDLE_TICKS = 120
+# 空闲期轮询间隔（秒）。
+#
+# 2026-11-12 从 0.5 降到 0.1：菜单弹出到用户点 logo 通常在 0.3 秒内，
+# 0.5 秒的轮询有相当概率整个错过「菜单窗口存在」的窗口期 →
+# 表现为「有时能切有时不能」。0.1 秒下每次轮询的探测开销
+# （find_menu_windows 0.9ms + mouse_state 0.0ms）可以忽略。
+IDLE_POLL_INTERVAL = 0.1
+# 数据刷新周期（次数）。0.1s × 600 = 60 秒，与原来的 60 秒一致。
+IDLE_TICKS = 600
+# 点击有效期（秒）。超过这个时间的 leftMouseUp 视为「与本次轮询无关」，
+# 直接丢弃。取值要大于「用户点完 → 菜单窗口可枚举」的延迟。
+# 2026-11-12 从 1.2 放宽到 3.0：1.2 秒时大量点击被静默丢弃
+# （且丢在日志之前，排查时完全看不到）。
+CLICK_STALE_SEC = 3.0
 
 # ===================== 模型定义 =====================
 MODELS = [
@@ -313,6 +323,8 @@ def draw_logo_strip(active=28, inactive=24, gap=6, pad=3):
 _sel_hint = ['bigmodel']
 # 条带几何（draw_logo_strip 返回的 [(x0,x1,key),...]），给点击探测器用
 _strip_geom = [None]
+# 条带图总宽（px），用于多窗口时判定哪个窗口含条带
+_strip_w = [154]
 # 点击探测状态：上次见到的 leftMouseUp 时间戳（秒）；None=尚未基线化
 _last_up_ts = [None]
 
@@ -427,6 +439,35 @@ def find_menu_windows():
         return []
 
 
+def pick_strip_window(wins, mx, my):
+    """从多个 SwiftBar 菜单窗口里挑出「含 logo 条带」的那一个。
+
+    背景（2026-11-12 实测）：v1 与 v2 两个插件并存，SwiftBar 会在同一个
+    状态栏区域生成多个 NSMenu 弹窗（各自的窗口宽度不同）。旧的取法是
+    「第一个包含鼠标的窗口」，会选到另一个插件的菜单 → 条带起始 X 算错
+    → 命中错位或落空。
+
+    判定：条带图宽 154pt，条带左缘 = 窗口 x + MENU_IMG_INSET(14)，
+    因此条带覆盖 [x+14, x+14+strip_w]。取「鼠标到条带左缘的偏移」
+    落在 [0, strip_w] 的窗口。
+    """
+    strip_w = _strip_w[0] or 154
+    cands = [(wx, wy, ww, wh) for (_n, wx, wy, ww, wh) in wins
+             if wx <= mx < wx + ww and wy <= my < wy + wh]
+    if not cands:
+        return None
+    if len(cands) == 1:
+        return cands[0]
+    # 多窗口：优先选能让鼠标落在条带内的那个
+    best = None
+    for (wx, wy, ww, wh) in cands:
+        rel = mx - (wx + MENU_IMG_INSET)
+        if 0 <= rel <= strip_w:
+            best = (wx, wy, ww, wh)
+            break
+    return best or cands[0]
+
+
 def mouse_state():
     """返回 (mx, my, up_elapsed)。up_elapsed = 距上次真实 leftMouseUp 的秒数。
 
@@ -470,13 +511,25 @@ def handle_menu_click(prev_sel):
         return None
     # 出现了新的 leftMouseUp（up 变小 = 计时器刚被重置）
     _last_up_ts[0] = up
-    if up > 1.2:
-        return None                  # 太久前的点击，与本次轮询无关
+    if up > CLICK_STALE_SEC:
+        # 太久前的点击，与本次轮询无关。
+        # 门槛要放宽：SwiftBar 重绘菜单需要时间，用户点完 logo 后
+        # 菜单可能到 1 秒后才被检测到窗口。门槛太窄会「静默丢弃」，
+        # 表现为「有时能切有时不能」且日志里什么都没有。
+        _log_click({'mx': mx, 'my': my, 'method': 'none', 'hit': None,
+                    'prev': prev_sel, 'up': round(up, 3),
+                    'reason': 'stale_click'})
+        return None
     # 鼠标必须在某个 SwiftBar 菜单窗口内
     wins = find_menu_windows()
-    win = next(((wx, wy, ww, wh) for (_n, wx, wy, ww, wh) in wins
-                if wx <= mx < wx + ww and wy <= my < wy + wh), None)
+    win = pick_strip_window(wins, mx, my)
     if win is None:
+        # 没有窗口 → 说明菜单已收起/还没弹出，记一条便于排查
+        _log_click({'mx': mx, 'my': my, 'method': 'none',
+                    'hit': None, 'prev': prev_sel,
+                    'reason': 'no_menu_window',
+                    'wins': [(int(x), int(y), int(w), int(h))
+                             for (_n, x, y, w, h) in wins]})
         return None
     geom = _strip_geom[0]
     if not geom:
@@ -512,7 +565,7 @@ def handle_menu_click(prev_sel):
             break
     _log_click({'mx': mx, 'my': my, 'method': method, 'strip_left': strip_left,
                 'strip_top': strip_top, 'rel_x': rel_x, 'hit': hit,
-                'prev': prev_sel,
+                'prev': prev_sel, 'up': round(up, 3),
                 'wins': [(int(x), int(y), int(w), int(h))
                          for (_n, x, y, w, h) in wins]})
     if hit and hit != prev_sel:
@@ -872,6 +925,7 @@ def render_dropdown(data, errors, sel):
     strip_png, strip_geom = draw_logo_strip()
     # 条带几何存给点击探测器（x0/x1 相对条带图左缘）
     _strip_geom[0] = strip_geom
+    _strip_w[0] = struct.unpack('>I', strip_png[16:20])[0]
     out.append(' | image=' + b64(strip_png)
                + ' tooltip=点击 logo 切换 provider（无需展开列表）')
     out.append('当前：' + model['name'] + ' | size=11 color=#8a8680')
