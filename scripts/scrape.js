@@ -3,6 +3,7 @@
 //       data/latest.json (结构化摘要，供 SwiftBar / dashboard 使用)
 // 用法: node scrape.js [--headful]
 const { chromium } = require('playwright');
+const { launchLocked } = require('./profile_lock');
 const path = require('path');
 const fs = require('fs');
 
@@ -35,11 +36,11 @@ const SITES = [
 ];
 
 (async () => {
-  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
+  const context = await launchLocked(chromium, PROFILE_DIR, {
     headless: !HEADFUL,
     viewport: { width: 1400, height: 900 },
     args: ['--disable-blink-features=AutomationControlled'],
-  });
+  }, { timeoutMs: 20000, label: 'scrape' })
 
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
   const result = { scraped_at: new Date().toISOString(), sites: {} };

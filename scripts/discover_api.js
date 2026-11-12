@@ -3,6 +3,7 @@
 // 复用 Playwright persistent context，跟其他站点的 cookie+header 鉴权方式完全不同）。
 // 在这里跑 deepseek 只会覆盖 api-requests.json 里已有的 6 条 API 为空数组。
 const { chromium } = require('playwright');
+const { launchLocked } = require('./profile_lock');
 const path = require('path');
 const fs = require('fs');
 
@@ -31,10 +32,10 @@ const TARGETS = [
 ];
 
 (async () => {
-  const context = await chromium.launchPersistentContext(path.join(ROOT, 'browser-profile'), {
+  const context = await launchLocked(chromium, path.join(ROOT, 'browser-profile'), {
     headless: true,
     args: ['--disable-blink-features=AutomationControlled'],
-  });
+  }, { timeoutMs: 20000, label: 'discover_api' })
   const out = {};
   for (const t of TARGETS) {
     const page = await context.newPage();

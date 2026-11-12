@@ -2,6 +2,7 @@
 // 抓 XHR/fetch 请求的 URL + 响应体，确认真实 API 与鉴权方式。
 // 用法: node scripts/minimax_probe.js
 const { chromium } = require('playwright');
+const { launchLocked } = require('./profile_lock');
 const path = require('path');
 const fs = require('fs');
 
@@ -12,11 +13,11 @@ const TARGETS = [
 ];
 
 (async () => {
-  const context = await chromium.launchPersistentContext(path.join(ROOT, 'browser-profile'), {
+  const context = await launchLocked(chromium, path.join(ROOT, 'browser-profile'), {
     headless: true,
     viewport: { width: 1400, height: 900 },
     args: ['--disable-blink-features=AutomationControlled'],
-  });
+  }, { timeoutMs: 20000, label: 'minimax_probe' })
 
   for (const t of TARGETS) {
     const page = await context.newPage();

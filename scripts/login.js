@@ -13,6 +13,7 @@
 //   node scripts/login.js          # 有头：打开浏览器，逐站检测，人工登录
 //   node scripts/login.js --check  # 无头：只检测当前各站登录态并打印结果（不打开窗口）
 const { chromium } = require('playwright');
+const { launchLocked, setManualLogin } = require('./profile_lock');
 const path = require('path');
 
 const CHECK_ONLY = process.argv.includes('--check');
@@ -85,11 +86,11 @@ const SITES = [
     // executablePath 在某些版本下不抛错，忽略即可
   }
 
-  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
+  const context = await launchLocked(chromium, PROFILE_DIR, {
     headless: CHECK_ONLY,
     viewport: { width: 1400, height: 900 },
     args: ['--disable-blink-features=AutomationControlled'],
-  });
+  }, { timeoutMs: 20000, label: 'login' })
 
   if (!CHECK_ONLY) console.log('浏览器已打开，正在为各站点加载页面并检测登录态：\n');
 
@@ -190,8 +191,13 @@ const SITES = [
   const deadline = Date.now() + 15 * 60 * 1000; // 15 分钟
   let lastLine = '';
   const probed = {};
+  // 2026-11-12：人工登录期间最长 15 分钟，期间后台采集必须让路，
+  // 否则它会起第二个 Chromium 抢同一个 browser-profile → 两者都崩。
+  // 打个标记，fetch.py 读到就跳过所有 Playwright 步骤。
+  setManualLogin(true);
+  console.log('（已标记人工登录中，后台采集将暂时让路；登录完成关闭浏览器后自动恢复）\n');
   while (Date.now() < deadline) {
-    const results = SITES.map(s => [s.name, check(s)]);
+    const results = SITES.map((s) => [s.name, check(s)]);
     const line = results.map(([n, ok]) => `${ok ? '✅' : '⭕️'} ${n}`).join('   ');
     if (line !== lastLine) {
       console.log(line);
@@ -215,6 +221,7 @@ const SITES = [
 
   // 关闭浏览器 → persistent context 自动落盘 cookie / localStorage
   await new Promise(resolve => context.on('close', resolve));
+  setManualLogin(false);          // 解除人工登录标记，后台采集恢复
   console.log('\n登录态已保存到:', PROFILE_DIR);
 
   // 把 probe 期间捕获到的鉴权头直接并入 api-requests.json。

@@ -5,6 +5,7 @@
 // 本脚本是全自动，用于「已登录但 cookie 过期」时刷新会话。
 // 用法: node scripts/minimax_refresh_auth.js
 const { chromium } = require('playwright');
+const { launchLocked } = require('./profile_lock');
 const path = require('path');
 const fs = require('fs');
 
@@ -23,11 +24,11 @@ const INTERESTING = ['authorization', 'api-key', 'x-api-key', 'x-token', 'token'
                       'access-token', 'x-access-token', 'mm-token', 'x-mmx-token'];
 
 (async () => {
-  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
+  const context = await launchLocked(chromium, PROFILE_DIR, {
     headless: true,
     viewport: { width: 1400, height: 900 },
     args: ['--disable-blink-features=AutomationControlled'],
-  });
+  }, { timeoutMs: 20000, label: 'minimax_refresh_auth' })
 
   const page = await context.newPage();
   const captured = [];

@@ -86,6 +86,15 @@ def refresh_auth():
                NODE_PATH='/Users/hanamaki_mac_mini/.workbuddy/binaries/node/workspace/node_modules')
     node = '/opt/homebrew/bin/node'
     failed = []
+    # 2026-11-12：人工登录进行中 → 不要抢 browser-profile。
+    # 所有 Playwright 脚本共用同一个 user-data-dir，第二个实例会被 Chrome
+    # 判定为「重复启动」并立即退出（"正在现有的浏览器会话中打开"），
+    # 导致人工登录脚本和后台采集**双双崩溃**。人工登录最长 15 分钟，
+    # 这期间直接跳过刷新，用现有凭证采集。
+    if manual_login_active():
+        print('  ⏸ 人工登录进行中，跳过 Playwright 刷新（用现有凭证采集）',
+              file=sys.stderr)
+        return failed
     # minimax_refresh_auth.js 是非交互的（复用已登录 profile 刷新会话），
     # 若 profile 登录态已失效它会 exit 2 并提示需人工登录。
     for s in ('dump_cookies.js', 'discover_api.js', 'mimo_refresh_session.js',
@@ -110,9 +119,28 @@ def refresh_auth():
     return failed
 
 
+def manual_login_active():
+    """人工登录是否进行中（scripts/login.js 打的标记）。
+
+    2026-11-12：所有 Playwright 脚本共用同一个 browser-profile 目录，
+    Chromium 用 SingletonLock 保证「一个 user-data-dir 同时只能有一个实例」。
+    人工登录（login.js，最长 15 分钟）与后台采集（discover_api.js 等）
+    同时启动时，后启动的实例会被 Chrome 判定为重复启动：
+        [out] 正在现有的浏览器会话中打开。
+    然后进程立刻退出，Playwright 抛「browser has been closed」。
+    → 人工登录和后台采集**双双崩溃**。
+
+    login.js 会写 data/.profile.lock/manual 标记，这里读到就跳过
+    所有 Playwright 步骤，只用现有凭证采集。
+    """
+    try:
+        return os.path.exists(os.path.join(ROOT, 'data', '.profile.lock', 'manual'))
+    except Exception:
+        return False
+
+
 def cookie_header(cookies, domain):
     return '; '.join(f"{c['name']}={c['value']}" for c in cookies.get(domain, []))
-
 
 def pick_headers(req, keys):
     return {k: v for k, v in req['headers'].items() if k in keys}
@@ -253,6 +281,10 @@ def refresh_auth_for(site, reqs):
     env = dict(os.environ,
                NODE_PATH='/Users/hanamaki_mac_mini/.workbuddy/binaries/node/workspace/node_modules')
     node = '/opt/homebrew/bin/node'
+    # 2026-11-12：人工登录进行中 → 不能抢 browser-profile，跳过刷新。
+    if manual_login_active():
+        print(f'  ⏸ 人工登录进行中，跳过 {site} 的鉴权刷新', file=sys.stderr)
+        return False
     # 站点 → 负责刷新其鉴权的脚本
     SCRIPTS = {
         'bigmodel': ['discover_api.js'],      # 抓 bigmodel 的 authorization
@@ -533,6 +565,10 @@ def fetch_deepseek(reqs):
     env = dict(os.environ,
                NODE_PATH='/Users/hanamaki_mac_mini/.workbuddy/binaries/node/workspace/node_modules')
     node = '/opt/homebrew/bin/node'
+    # 2026-11-12：人工登录进行中 → 不能抢 browser-profile。
+    # 缓存已过期也没关系，人工登录结束后下一轮会重新采集。
+    if manual_login_active():
+        raise RuntimeError('人工登录进行中，跳过 deepseek 采集（避免抢 browser-profile）')
     proc = subprocess.run(
         [node, os.path.join(ROOT, 'scripts', 'deepseek_discover.js')],
         cwd=ROOT, env=env, capture_output=True, timeout=120,

@@ -9,6 +9,7 @@
 // 本脚本：打开登录页 → 人工登录 → 检测登录成功 → 抓真实请求头（含鉴权头）→ 落盘
 // 用法: node scripts/minimax_login.js
 const { chromium } = require('playwright');
+const { launchLocked } = require('./profile_lock');
 const path = require('path');
 const fs = require('fs');
 
@@ -26,11 +27,11 @@ const TARGETS = [
 ];
 
 (async () => {
-  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
+  const context = await launchLocked(chromium, PROFILE_DIR, {
     headless: false,
     viewport: { width: 1400, height: 900 },
     args: ['--disable-blink-features=AutomationControlled'],
-  });
+  }, { timeoutMs: 20000, label: 'minimax_login' })
 
   const page = await context.newPage();
   const captured = [];

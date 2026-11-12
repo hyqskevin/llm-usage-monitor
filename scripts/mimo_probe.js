@@ -1,6 +1,7 @@
 // 探测脚本：无头打开 MiMo 套餐用量页，截图 + innerText + 抓 API 请求，判断登录态。
 // 用法: node scripts/mimo_probe.js
 const { chromium } = require('playwright');
+const { launchLocked } = require('./profile_lock');
 const path = require('path');
 const fs = require('fs');
 
@@ -8,11 +9,11 @@ const ROOT = path.join(__dirname, '..');
 const URL = 'https://platform.xiaomimimo.com/console/plan-manage?edition=PERSONAL';
 
 (async () => {
-  const context = await chromium.launchPersistentContext(path.join(ROOT, 'browser-profile'), {
+  const context = await launchLocked(chromium, path.join(ROOT, 'browser-profile'), {
     headless: true,
     viewport: { width: 1400, height: 900 },
     args: ['--disable-blink-features=AutomationControlled'],
-  });
+  }, { timeoutMs: 20000, label: 'mimo_probe' })
   const page = await context.newPage();
 
   const apiRequests = [];

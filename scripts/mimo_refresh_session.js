@@ -3,6 +3,7 @@
 // session 级、不落盘），导出到 data/mimo-session.json 供 fetch.py 纯 HTTP 重放。
 // 用法: node scripts/mimo_refresh_session.js
 const { chromium } = require('playwright');
+const { launchLocked } = require('./profile_lock');
 const path = require('path');
 const fs = require('fs');
 
@@ -11,10 +12,10 @@ const OUT = path.join(ROOT, 'data', 'mimo-session.json');
 const URL = 'https://platform.xiaomimimo.com/console/plan-manage?edition=PERSONAL';
 
 (async () => {
-  const context = await chromium.launchPersistentContext(path.join(ROOT, 'browser-profile'), {
+  const context = await launchLocked(chromium, path.join(ROOT, 'browser-profile'), {
     headless: true,
     args: ['--disable-blink-features=AutomationControlled'],
-  });
+  }, { timeoutMs: 20000, label: 'mimo_refresh_session' })
   const page = await context.newPage();
   await page.goto(URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
 

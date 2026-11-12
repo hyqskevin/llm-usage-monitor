@@ -2,6 +2,7 @@
 // 抓 deepseek /usage 的所有 API 请求 + DOM 数据，用于写 fetch_deepseek() 真实解析。
 // 用法: node deepseek_discover.js
 const { chromium } = require('playwright');
+const { launchLocked } = require('./profile_lock');
 const fs = require('fs');
 const path = require('path');
 
@@ -11,11 +12,11 @@ const OUT_JSON = path.join(ROOT, 'data', 'api-requests.json');
 const OUT_DOM = path.join(ROOT, 'data', 'deepseek-dom.json');
 
 (async () => {
-  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
+  const context = await launchLocked(chromium, PROFILE_DIR, {
     headless: true,
     viewport: { width: 1400, height: 900 },
     args: ['--disable-blink-features=AutomationControlled'],
-  });
+  }, { timeoutMs: 20000, label: 'deepseek_discover' })
   const page = await context.newPage();
 
   // 抓所有 API 请求 + 响应 body

@@ -4,6 +4,7 @@
 // 同时把响应原文存 data/mimo-requests-raw.json 供人工核对 API 形状。
 // 用法: node scripts/mimo_discover.js
 const { chromium } = require('playwright');
+const { launchLocked } = require('./profile_lock');
 const path = require('path');
 const fs = require('fs');
 
@@ -16,11 +17,11 @@ const isApi = (u) => u.includes('xiaomimimo.com') &&
   (u.includes('/api/') || u.includes('/console/') || u.includes('usage') || u.includes('quota') || u.includes('plan'));
 
 (async () => {
-  const context = await chromium.launchPersistentContext(path.join(ROOT, 'browser-profile'), {
+  const context = await launchLocked(chromium, path.join(ROOT, 'browser-profile'), {
     headless: true,
     viewport: { width: 1400, height: 900 },
     args: ['--disable-blink-features=AutomationControlled'],
-  });
+  }, { timeoutMs: 20000, label: 'mimo_discover' })
   const page = await context.newPage();
 
   const apiRequests = [];
