@@ -13,7 +13,7 @@
 //   node scripts/login.js          # 有头：打开浏览器，逐站检测，人工登录
 //   node scripts/login.js --check  # 无头：只检测当前各站登录态并打印结果（不打开窗口）
 const { chromium } = require('playwright');
-const { launchLocked, setManualLogin } = require('./profile_lock');
+const { launchLocked, setManualLogin, releaseProfileLock } = require('./profile_lock');
 const path = require('path');
 
 const CHECK_ONLY = process.argv.includes('--check');
@@ -221,7 +221,11 @@ const SITES = [
 
   // 关闭浏览器 → persistent context 自动落盘 cookie / localStorage
   await new Promise(resolve => context.on('close', resolve));
-  setManualLogin(false);          // 解除人工登录标记，后台采集恢复
+  // 2026-11-12：浏览器一关，launchLocked 包装的 'close' 监听就会释放 profile 锁。
+  // 必须确保它**已经释放**再调下面的子脚本 —— 它们要拿同一把锁，
+  // 否则会自死锁（子脚本 20 秒超时失败 → mimo-session.json 不更新 →
+  // 用户明明登录了，采集仍读 11-11 的旧 token → 401）。
+  releaseProfileLock();
   console.log('\n登录态已保存到:', PROFILE_DIR);
 
   // 把 probe 期间捕获到的鉴权头直接并入 api-requests.json。
@@ -299,5 +303,8 @@ const SITES = [
       console.log(`  ⚠️  ${s} 失败: ${msg}`);
     }
   }
+  // 全部同步完成才解除人工登录标记 —— 标记期间后台采集会跳过 Playwright 步骤，
+  // 避免和上面的子脚本抢 browser-profile。
+  setManualLogin(false);
   console.log('\n完成。SwiftBar 下次刷新（最多 10 分钟）即会显示最新数据。');
 })().catch(e => { console.error('ERROR:', e); process.exit(1); });

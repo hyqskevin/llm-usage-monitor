@@ -140,7 +140,8 @@ def test_manual_flag_readable_by_fetch():
     check('默认没有人工登录标记', f.manual_login_active() is False)
 
     os.makedirs(LOCK_DIR, exist_ok=True)
-    manual = os.path.join(LOCK_DIR, 'manual')
+    # 标记文件独立于 LOCK_DIR（锁目录关闭时会被整体删掉）
+    manual = os.path.join(ROOT, 'data', '.profile.manual')
     with open(manual, 'w') as fp:
         fp.write(f'{os.getpid()} {int(time.time()*1000)}')
     check('标记写入后 fetch.manual_login_active() 为 True',
@@ -198,6 +199,9 @@ if __name__ == '__main__':
         try:
             import shutil
             shutil.rmtree(LOCK_DIR, ignore_errors=True)
+            m = os.path.join(ROOT, 'data', '.profile.manual')
+            if os.path.exists(m):
+                os.remove(m)
         except Exception:
             pass
 

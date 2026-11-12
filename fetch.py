@@ -130,11 +130,11 @@ def manual_login_active():
     然后进程立刻退出，Playwright 抛「browser has been closed」。
     → 人工登录和后台采集**双双崩溃**。
 
-    login.js 会写 data/.profile.lock/manual 标记，这里读到就跳过
+    login.js 会写 data/.profile.manual 标记，这里读到就跳过
     所有 Playwright 步骤，只用现有凭证采集。
     """
     try:
-        return os.path.exists(os.path.join(ROOT, 'data', '.profile.lock', 'manual'))
+        return os.path.exists(os.path.join(ROOT, 'data', '.profile.manual'))
     except Exception:
         return False
 

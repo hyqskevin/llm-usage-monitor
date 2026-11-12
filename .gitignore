@@ -29,3 +29,4 @@ data/deepseek-rows.json
 .workbuddy/
 data/.heartbeat.json
 data/.profile.lock/
+data/.profile.manual

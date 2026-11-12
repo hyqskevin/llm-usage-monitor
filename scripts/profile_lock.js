@@ -31,7 +31,12 @@ const LOCK_DIR = path.join(__dirname, '..', 'data', '.profile.lock');
 const PID_FILE = path.join(LOCK_DIR, 'pid');
 // 人工登录标记：login.js 会持有 profile 最长 15 分钟等人登录，
 // 这期间后台采集必须让路（fetch.py 读到它就跳过所有 Playwright 步骤）。
-const MANUAL_FLAG = path.join(LOCK_DIR, 'manual');
+//
+// 关键：标记文件**不能**放在 LOCK_DIR 里。
+// LOCK_DIR 会在 context 关闭时整个被删掉，标记会跟着消失 ——
+// 而 login.js 恰恰要在「浏览器已关、子脚本还要跑」这段窗口里保持标记。
+// 所以单独放一个文件。
+const MANUAL_FLAG = path.join(__dirname, '..', 'data', '.profile.manual');
 
 // 锁被视为陈旧的阈值：进程还在但超过这个时间没释放，也当作无效
 const STALE_MS = 15 * 60 * 1000;
@@ -128,8 +133,8 @@ function releaseProfileLock() {
 function setManualLogin(on) {
   try {
     if (on) {
-      fs.mkdirSync(LOCK_DIR, { recursive: true });
-      fs.writeFileSync(PID_FILE, `${process.pid} ${Date.now()}`);
+      // 标记文件独立于 LOCK_DIR —— 锁目录会在 context 关闭时被整体删除，
+      // 而 login.js 恰恰要在「浏览器已关、子脚本还要跑」这段窗口里保持标记。
       fs.writeFileSync(MANUAL_FLAG, `${process.pid} ${Date.now()}`);
     } else {
       try { fs.rmSync(MANUAL_FLAG, { force: true }); } catch (e) {}
@@ -170,7 +175,10 @@ async function withProfileLock(fn, opts = {}) {
 
 /**
  * 带锁启动 persistent context —— 所有脚本的标准入口。
- * 锁在 context.close() 时释放（包装 close 方法）。
+ * 锁在以下任一条件满足时释放：
+ *   - context.close() 被显式调用
+ *   - context 触发 'close' 事件（用户手动关浏览器窗口）—— login.js 走的是这条路
+ *   - 进程退出
  *
  * @param {object} chromium playwright.chromium
  * @param {string} profileDir user-data-dir 路径
@@ -189,16 +197,24 @@ async function launchLocked(chromium, profileDir, launchOpts = {}, opts = {}) {
   }
   const origClose = context.close.bind(context);
   let closed = false;
+  const release = () => {
+    if (closed) return;
+    closed = true;
+    releaseProfileLock();
+  };
   context.close = async (...args) => {
     try {
       return await origClose(...args);
     } finally {
-      if (!closed) {
-        closed = true;
-        releaseProfileLock();
-      }
+      release();
     }
   };
+  // 用户手动关浏览器窗口时 context 也会触发 'close'。
+  // login.js 就是靠这个事件等「用户关窗」→ 必须在这里释放锁，
+  // 否则它后续调用的子脚本（mimo_refresh_session.js 等）会拿不到锁 → 自死锁。
+  try {
+    context.on('close', release);
+  } catch (e) {}
   return context;
 }
 
