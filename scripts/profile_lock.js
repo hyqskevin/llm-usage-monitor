@@ -78,6 +78,47 @@ function cleanStale() {
 }
 
 /**
+ * 杀掉「孤儿 Chromium」—— 占着 browser-profile 但父进程已死的 Chrome。
+ *
+ * 场景（2026-11-12 15:40 实锤）：
+ *   login.js 被 kill / 超时退出后，它的 Chromium 子进程会活下来
+ *   （实测残留 24 分钟），继续持有 profile 的 SingletonLock。
+ *   此时锁目录可能已被清掉（pid 检测认为持有者死了），
+ *   但 Chromium 还在 → 新实例启动时 Chrome 判定「重复启动」→
+ *   立即退出 → Playwright 抛 browser closed。
+ *
+ * 判定：进程命令行含 user-data-dir=<我们的 profile 路径>，
+ *      且它的父进程已经不存在 → 孤儿。
+ */
+function killOrphanChromium() {
+  const profileDir = path.join(__dirname, '..', 'browser-profile');
+  let out = '';
+  try {
+    out = require('child_process').execSync(
+      `ps -eo pid,ppid,command | grep -F "user-data-dir=${profileDir}" | grep -v grep`,
+      { encoding: 'utf8', timeout: 5000 }
+    );
+  } catch (e) {
+    return 0;   // 没有匹配进程
+  }
+  const killed = [];
+  for (const line of out.split('\n')) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+    if (!m) continue;
+    const pid = parseInt(m[1], 10);
+    const ppid = parseInt(m[2], 10);
+    if (pid === process.pid) continue;
+    // 父进程还活着 → 不是孤儿（可能是别人正在用的浏览器）
+    if (ppid > 1 && pidAlive(ppid)) continue;
+    try {
+      process.kill(pid, 'SIGTERM');
+      killed.push(pid);
+    } catch (e) {}
+  }
+  return killed.length;
+}
+
+/**
  * 获取 profile 锁。
  * @param {number} timeoutMs 等待上限；超时抛错
  * @param {string} label 日志前缀
@@ -85,6 +126,12 @@ function cleanStale() {
 async function acquireProfileLock(timeoutMs = 120000, label = 'profile') {
   const deadline = Date.now() + timeoutMs;
   let waited = false;
+  // 拿锁前先清一次孤儿 Chromium —— 它们会占着 profile 的 SingletonLock，
+  // 导致新实例启动即退出（"正在现有的浏览器会话中打开"）。
+  try {
+    const n = killOrphanChromium();
+    if (n > 0) console.log(`[${label}] 清理了 ${n} 个孤儿 Chromium 进程（占着 browser-profile）`);
+  } catch (e) {}
   while (true) {
     try {
       fs.mkdirSync(LOCK_DIR);                 // 原子：只可能有一个成功
@@ -220,5 +267,5 @@ async function launchLocked(chromium, profileDir, launchOpts = {}, opts = {}) {
 
 module.exports = {
   withProfileLock, acquireProfileLock, releaseProfileLock, launchLocked,
-  setManualLogin, isManualLogin, LOCK_DIR, MANUAL_FLAG,
+  setManualLogin, isManualLogin, killOrphanChromium, LOCK_DIR, MANUAL_FLAG,
 };

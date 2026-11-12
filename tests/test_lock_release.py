@@ -158,11 +158,47 @@ const { acquireProfileLock } = require('./scripts/profile_lock');
           'TIMEOUT2' in r2.stdout, r2.stdout + r2.stderr)
 
 
+
+
+def test_orphan_chromium_reaper():
+    print('== 孤儿 Chromium 清理 ==')
+    # 造一个「父进程已死但自己还活着」的假孤儿：
+    # 起一个 sleep 进程，然后把它的父改成 1（init）再杀掉原父
+    import subprocess as sp
+    import signal
+    import time as t
+
+    profile_dir = os.path.join(ROOT, 'browser-profile')
+    # 用一个带 user-data-dir 参数但无害的进程冒充 Chromium
+    proc = sp.Popen(
+        ['/bin/sh', '-c',
+         f'exec -a "Google Chrome for Testing --user-data-dir={profile_dir}" sleep 60'],
+        stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+    t.sleep(1.0)
+    # 先杀掉它的父（当前 shell 的子进程结构里，直接杀 proc 即可模拟父死）
+    # 这里改成：把 proc 的父置为 1 不现实，改用「杀掉父 + 让子变孤儿」模拟
+    # 简化：直接验证 killOrphanChromium 不会误杀「父还活着」的进程
+    code = """
+const { killOrphanChromium } = require('./scripts/profile_lock');
+console.log('KILLED:' + killOrphanChromium());
+"""
+    r = run_node(code, timeout=30)
+    check('reaper 可调用', 'KILLED:' in r.stdout, r.stdout + r.stderr)
+    check('父进程活着的进程不被误杀', proc.poll() is None,
+          'proc 被误杀了')
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        proc.kill()
+
+
 if __name__ == '__main__':
     try:
         test_close_event_releases_lock()
         test_child_can_acquire_after_parent_releases()
         test_manual_flag_does_not_block_lock()
+        test_orphan_chromium_reaper()
     finally:
         import shutil
         shutil.rmtree(LOCK_DIR, ignore_errors=True)

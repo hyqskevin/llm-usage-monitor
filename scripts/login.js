@@ -219,6 +219,17 @@ const SITES = [
 
   if (!lastLine) console.log('（检测超时，可继续手动登录后关闭浏览器）');
 
+  // 超时（15 分钟到）但用户没关浏览器 → 主动关掉。
+  // 否则 Chromium 会一直占着 browser-profile，后台采集的每个 Playwright
+  // 脚本都会因拿不到 profile 而失败（实测：残留进程能存活 24 分钟）。
+  if (await context.pages().then(p => p.length > 0).catch(() => true)) {
+    try {
+      await context.close();
+      console.log('（已超时，自动关闭浏览器）');
+      await new Promise(r => setTimeout(r, 1000));
+    } catch (e) {}
+  }
+
   // 关闭浏览器 → persistent context 自动落盘 cookie / localStorage
   await new Promise(resolve => context.on('close', resolve));
   // 2026-11-12：浏览器一关，launchLocked 包装的 'close' 监听就会释放 profile 锁。
